@@ -53,6 +53,12 @@ exports/
 .DS_Store
 Thumbs.db
 
+# PyInstaller (artefactos de build)
+/build/
+/dist/
+*.manifest
+build_log.txt
+
 # IDE
 .vscode/
 .idea/
