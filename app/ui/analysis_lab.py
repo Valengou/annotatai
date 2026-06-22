@@ -59,6 +59,7 @@ class AnalysisLabDialog(QDialog):
         self._backend = QComboBox()
         self._backend.addItem("OpenCLIP ViT-B/32", "openclip")
         self._backend.addItem("DINOv2 ViT-S/14", "dinov2")
+        self._backend.addItem("DINOv3 ViT-S/16", "dinov3")
         self._backend.addItem("SigLIP base", "siglip")
         self._backend.addItem("ConvNeXt checkpoint", "convnext_checkpoint")
         self._backend.currentIndexChanged.connect(self._update_backend_fields)

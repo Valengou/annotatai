@@ -10,6 +10,14 @@ HDBSCAN_MIN_SAMPLES = 3
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 
+# Ruta por defecto al checkpoint de SAM 3 (gated, descarga manual desde HuggingFace).
+# Editable desde el diálogo de auto-etiquetado.
+DEFAULT_SAM3_MODEL = r"C:\Users\valen\Documents\Valen\Drone_AI\Code\sam3_dataset_creator\sam3.pt"
+
+# Modelo SAM interactivo por punto (click-to-box en el editor). SAM2 es el modelo
+# promptable por punto; se descarga solo. SAM3 es para conceptos/texto, no puntos.
+DEFAULT_INTERACTIVE_SAM_MODEL = "sam2.1_b.pt"
+
 DEFAULT_CLASSES = [
     {"name": "object", "color": "#FF0000"},
 ]

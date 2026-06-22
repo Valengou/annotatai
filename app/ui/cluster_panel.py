@@ -10,6 +10,8 @@ from ..models.cluster import Cluster
 class ClusterPanel(QWidget):
     cluster_selected        = Signal(int)   # cluster_id  (-1 = all)
     cluster_delete_requested = Signal(int)  # cluster_id
+    cluster_autolabel_requested = Signal(int)  # cluster_id  (YOLOE visual)
+    cluster_sam3_requested  = Signal(int)    # cluster_id  (SAM 3 texto)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -99,6 +101,11 @@ class ClusterPanel(QWidget):
         cluster_name = item.text(0).split("  (")[0]
 
         menu = QMenu(self)
+        menu.addAction("✨  Propagar etiquetas al grupo (YOLOE)...",
+                       lambda: self.cluster_autolabel_requested.emit(cluster_id))
+        menu.addAction("🔤  Detectar por texto en el grupo (SAM 3)...",
+                       lambda: self.cluster_sam3_requested.emit(cluster_id))
+        menu.addSeparator()
         menu.addAction("Marcar como revisado",
                        lambda: self._set_status(cluster_id, "reviewed"))
         menu.addAction("Marcar como descartado",

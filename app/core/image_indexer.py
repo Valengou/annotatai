@@ -17,6 +17,13 @@ def index_images(folder: Path, db: Database, project_path: Path,
     """Index all images in folder, generate thumbnails, save to DB.
     Returns list of inserted image IDs."""
     image_paths = sorted(set(iter_images(folder)))
+    return index_image_paths(image_paths, db, project_path, progress_callback)
+
+
+def index_image_paths(image_paths: list[Path], db: Database, project_path: Path,
+                      progress_callback=None) -> list[int]:
+    """Index image paths, generate thumbnails, save to DB.
+    Returns list of image IDs."""
     total = len(image_paths)
     inserted_ids = []
 

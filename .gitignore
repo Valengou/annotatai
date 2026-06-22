@@ -8,15 +8,46 @@ venv/
 
 # Project data (user-created, not source)
 *.db
+*.db-wal
+*.db-shm
 *.pt
 *.pth
+*.onnx
 thumbnails/
 embeddings/
 exports/
 
-# Models downloaded at runtime
+# Datasets / salidas / modelos (anclados a la raíz, no tocan app/)
+/projects/
+/runs/
+/analysis_out/
+/analysis_output/
+/datasets/
+/data/
+/models/
+/weights/
+
+# Modelos descargados en runtime
 *.bin
 *.safetensors
+
+# Imágenes y video (datos, nunca se suben)
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.webp
+*.mp4
+*.mov
+*.avi
+
+# Otros datos
+*.npy
+*.npz
+*.csv
 
 # OS
 .DS_Store

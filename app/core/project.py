@@ -69,3 +69,8 @@ class Project:
     @staticmethod
     def is_valid_project(path: Path) -> bool:
         return (path / "project.json").exists() and (path / "project.db").exists()
+
+    @staticmethod
+    def is_manifest_file(path: Path) -> bool:
+        path = Path(path)
+        return path.is_file() and path.suffix.lower() == ".json"

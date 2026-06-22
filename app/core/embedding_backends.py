@@ -12,7 +12,7 @@ BatchProgress = Callable[[int, int], None]
 
 
 def available_backend_names() -> list[str]:
-    return ["openclip", "dinov2", "siglip", "convnext_checkpoint"]
+    return ["openclip", "dinov2", "dinov3", "siglip", "siglip2", "convnext_checkpoint"]
 
 
 def create_embedding_backend(
@@ -25,8 +25,12 @@ def create_embedding_backend(
         return OpenCLIPBackend(batch_size=batch_size)
     if normalized in {"dinov2", "dino_v2", "dino"}:
         return DinoV2Backend(batch_size=batch_size)
-    if normalized in {"siglip", "siglip2"}:
+    if normalized in {"dinov3", "dino_v3"}:
+        return DinoV3Backend(batch_size=batch_size)
+    if normalized in {"siglip"}:
         return SigLIPBackend(batch_size=batch_size)
+    if normalized in {"siglip2", "siglip_2"}:
+        return SigLIP2Backend(batch_size=batch_size)
     if normalized in {"convnext", "convnext_checkpoint", "convnext_features"}:
         return ConvNeXtCheckpointBackend(checkpoint_path=checkpoint_path, batch_size=batch_size)
     raise ValueError(f"Unknown embedding backend: {name}")
@@ -34,6 +38,7 @@ def create_embedding_backend(
 
 class ImageEmbeddingBackend:
     name = "base"
+    supports_text = False   # True si el backend tiene encoder de texto (búsqueda)
 
     def __init__(self, batch_size: int = 32):
         self.batch_size = max(1, int(batch_size))
@@ -45,6 +50,10 @@ class ImageEmbeddingBackend:
 
     def embed_paths(self, paths: Iterable[Path], progress_callback: BatchProgress | None = None) -> np.ndarray:
         raise NotImplementedError
+
+    def embed_text(self, texts: Iterable[str]) -> np.ndarray:
+        """Embeddings de texto, normalizados, en el mismo espacio que las imágenes."""
+        raise NotImplementedError(f"El backend '{self.name}' no soporta texto.")
 
     def _ensure_loaded(self) -> None:
         if not self._loaded:
@@ -147,6 +156,63 @@ class DinoV2Backend(ImageEmbeddingBackend):
         return np.concatenate(features, axis=0)
 
 
+class DinoV3Backend(ImageEmbeddingBackend):
+    name = "dinov3"
+
+    def __init__(
+        self,
+        batch_size: int = 32,
+        model_name: str = "facebook/dinov3-vits16-pretrain-lvd1689m",
+    ):
+        super().__init__(batch_size=batch_size)
+        self.model_name = model_name
+        self._model = None
+        self._processor = None
+        self._num_register_tokens = 4
+
+    def load(self) -> None:
+        import torch
+
+        try:
+            from transformers import AutoImageProcessor, AutoModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "DINOv3 backend requires transformers. Install it in the Label_studio venv "
+                "with: .venv\\Scripts\\python.exe -m pip install transformers"
+            ) from exc
+
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._processor = AutoImageProcessor.from_pretrained(self.model_name)
+        self._model = AutoModel.from_pretrained(
+            self.model_name,
+            attn_implementation="sdpa",
+        ).to(self._device)
+        self._model.eval()
+        self._num_register_tokens = int(getattr(self._model.config, "num_register_tokens", 4))
+        self._loaded = True
+
+    def embed_paths(self, paths: Iterable[Path], progress_callback: BatchProgress | None = None) -> np.ndarray:
+        import torch
+
+        self._ensure_loaded()
+        path_list = [Path(path) for path in paths]
+        features = []
+        with torch.no_grad():
+            for done, batch_paths in _batched(path_list, self.batch_size):
+                images = [_load_image(path) for path in batch_paths]
+                inputs = self._processor(images=images, return_tensors="pt").to(self._device)
+                outputs = self._model(**inputs)
+                batch_features = dinov3_cls_patch_embedding(
+                    outputs.last_hidden_state,
+                    num_register_tokens=self._num_register_tokens,
+                )
+                batch_features = batch_features / batch_features.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                features.append(batch_features.cpu().numpy())
+                if progress_callback:
+                    progress_callback(min(done + len(batch_paths), len(path_list)), len(path_list))
+        return np.concatenate(features, axis=0)
+
+
 class SigLIPBackend(ImageEmbeddingBackend):
     name = "siglip"
 
@@ -193,6 +259,83 @@ class SigLIPBackend(ImageEmbeddingBackend):
                 if progress_callback:
                     progress_callback(min(done + len(batch_paths), len(path_list)), len(path_list))
         return np.concatenate(features, axis=0)
+
+
+class SigLIP2Backend(ImageEmbeddingBackend):
+    """SigLIP2 con encoder de texto + imagen, para búsqueda semántica."""
+    name = "siglip2"
+    supports_text = True
+
+    def __init__(self, batch_size: int = 32,
+                 model_name: str = "google/siglip2-base-patch16-224"):
+        super().__init__(batch_size=batch_size)
+        self.model_name = model_name
+        self._model = None
+        self._processor = None
+
+    def load(self) -> None:
+        import torch
+
+        try:
+            from transformers import AutoModel, AutoProcessor
+        except ImportError as exc:
+            raise RuntimeError(
+                "SigLIP2 requiere transformers. Instalalo en el venv con: "
+                ".venv\\Scripts\\python.exe -m pip install -U transformers"
+            ) from exc
+
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._processor = AutoProcessor.from_pretrained(self.model_name)
+        self._model = AutoModel.from_pretrained(self.model_name).to(self._device)
+        self._model.eval()
+        self._loaded = True
+
+    @staticmethod
+    def _as_tensor(out):
+        """get_image_features/get_text_features pueden devolver un tensor o un
+        objeto ModelOutput según la versión de transformers; extrae el vector."""
+        import torch
+        if torch.is_tensor(out):
+            return out
+        for attr in ("image_embeds", "text_embeds", "pooler_output"):
+            v = getattr(out, attr, None)
+            if v is not None:
+                return v
+        lhs = getattr(out, "last_hidden_state", None)
+        if lhs is not None:
+            return lhs.mean(dim=1)
+        raise RuntimeError("SigLIP2: no se pudo extraer el vector de features")
+
+    def embed_paths(self, paths: Iterable[Path], progress_callback: BatchProgress | None = None) -> np.ndarray:
+        import torch
+
+        self._ensure_loaded()
+        path_list = [Path(path) for path in paths]
+        features = []
+        with torch.no_grad():
+            for done, batch_paths in _batched(path_list, self.batch_size):
+                images = [_load_image(path) for path in batch_paths]
+                inputs = self._processor(images=images, return_tensors="pt").to(self._device)
+                batch_features = self._as_tensor(self._model.get_image_features(**inputs))
+                batch_features = batch_features / batch_features.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+                features.append(batch_features.cpu().numpy())
+                if progress_callback:
+                    progress_callback(min(done + len(batch_paths), len(path_list)), len(path_list))
+        return np.concatenate(features, axis=0)
+
+    def embed_text(self, texts: Iterable[str]) -> np.ndarray:
+        import torch
+
+        self._ensure_loaded()
+        text_list = [str(t) for t in texts]
+        with torch.no_grad():
+            inputs = self._processor(
+                text=text_list, padding="max_length", truncation=True,
+                return_tensors="pt",
+            ).to(self._device)
+            feats = self._as_tensor(self._model.get_text_features(**inputs))
+            feats = feats / feats.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        return feats.cpu().numpy()
 
 
 class ConvNeXtCheckpointBackend(ImageEmbeddingBackend):
@@ -289,3 +432,12 @@ def _flatten_features(features):
     elif features.ndim > 2:
         features = features.flatten(start_dim=1)
     return features
+
+
+def dinov3_cls_patch_embedding(last_hidden_state, num_register_tokens: int = 4):
+    import torch
+
+    cls_token = last_hidden_state[:, 0, :]
+    patch_start = 1 + int(num_register_tokens)
+    patch_mean = last_hidden_state[:, patch_start:, :].mean(dim=1)
+    return torch.cat((cls_token, patch_mean), dim=1)

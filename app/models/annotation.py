@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Optional
+import json
 
 
 @dataclass
@@ -14,6 +15,7 @@ class Annotation:
     height: float = 0.0
     source: str = "human"   # human | suggested | propagated
     confidence: float = 1.0
+    polygon: Optional[list[tuple[float, float]]] = None
 
     def to_yolo_line(self, class_index: int) -> str:
         cx = self.x + self.width / 2
@@ -22,6 +24,9 @@ class Annotation:
 
     @classmethod
     def from_db_row(cls, row) -> "Annotation":
+        polygon = None
+        if len(row) > 10 and row[10]:
+            polygon = [tuple(point) for point in json.loads(row[10])]
         return cls(
             id=row[0],
             image_id=row[1],
@@ -33,4 +38,5 @@ class Annotation:
             height=row[7],
             source=row[8] if len(row) > 8 else "human",
             confidence=row[9] if len(row) > 9 else 1.0,
+            polygon=polygon,
         )

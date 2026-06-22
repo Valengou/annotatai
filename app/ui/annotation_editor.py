@@ -2,16 +2,19 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem,
+    QGraphicsPolygonItem,
     QGraphicsItem, QListWidget, QListWidgetItem, QComboBox,
-    QSplitter, QMenu, QCheckBox,
+    QSplitter, QMenu, QCheckBox, QAbstractItemView,
 )
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSizeF, QEvent
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSizeF, QEvent, QThread, QObject
 from PySide6.QtGui import (
-    QPixmap, QPen, QBrush, QColor, QFont, QPainter, QKeySequence,
+    QPixmap, QPen, QBrush, QColor, QFont, QPainter, QKeySequence, QIcon,
+    QPolygonF,
 )
 
 from ..models.image_item import ImageItem
 from ..models.annotation import Annotation
+from ..utils.config import DEFAULT_INTERACTIVE_SAM_MODEL
 
 
 H = 8   # handle size in pixels
@@ -108,11 +111,12 @@ class BoundingBoxItem(QGraphicsRectItem):
         self.annotation = annotation
         self.box_color = color
         self._handles: dict[str, ResizeHandle] = {}
+        self._polygon_item: QGraphicsPolygonItem | None = None
+        self._locked = False
         self._moving = False
         self._move_start: QPointF | None = None
         self._move_start_rect: QRectF | None = None
 
-        self._apply_style()
         self.setFlags(
             QGraphicsItem.ItemIsSelectable |
             QGraphicsItem.ItemSendsGeometryChanges
@@ -120,33 +124,63 @@ class BoundingBoxItem(QGraphicsRectItem):
         self.setZValue(5)
         self.setCursor(Qt.SizeAllCursor)
 
-        self._label = QGraphicsTextItem(self._label_text(), self)
-        self._label.setDefaultTextColor(color)
+        self._label = QGraphicsTextItem("", self)
         self._label.setFont(QFont("Arial", 9, QFont.Bold))
-        self._label.setPos(2, 2)
-        self._label.setZValue(6)
+        # Keep label a constant on-screen size regardless of zoom
+        self._label.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+        self._label.setZValue(7)
+
+        self._apply_style()
 
         for key in ["tl", "t", "tr", "r", "br", "b", "bl", "l"]:
             self._handles[key] = ResizeHandle(key, self)
         self._update_handle_positions()
 
-    def _is_yolo(self) -> bool:
-        return self.annotation.source == "yolo"
+    def _is_provisional(self) -> bool:
+        """Anotación sugerida por IA (SAM 3 / YOLOE), pendiente de validar."""
+        return self.annotation.source != "human"
 
-    def _label_text(self) -> str:
-        if self._is_yolo():
-            return f"{self.annotation.class_name} [YOLO {self.annotation.confidence:.0%}]"
-        return self.annotation.class_name
-
-    def _apply_style(self):
-        if self._is_yolo():
-            pen = QPen(self.box_color, 2, Qt.DashLine)
-        else:
-            pen = QPen(self.box_color, 2)
+    def _apply_style(self, selected: bool = False):
+        style = Qt.DashLine if self._is_provisional() else Qt.SolidLine
+        pen = QPen(self.box_color, 3 if selected else 2, style)
+        pen.setCosmetic(True)   # ancho constante en pantalla a cualquier zoom
         self.setPen(pen)
         fill = QColor(self.box_color)
-        fill.setAlpha(20 if self._is_yolo() else 30)
+        fill.setAlpha(70 if selected else (18 if self._is_provisional() else 28))
         self.setBrush(QBrush(fill))
+        # Fondo de la etiqueta con el color de la clase para que se lea siempre
+        bg = QColor(self.box_color)
+        bg.setAlpha(230)
+        self._label.setHtml(
+            f'<div style="background:{bg.name()};color:#fff;'
+            f'padding:0 3px;border-radius:2px;">{self._label_inner()}</div>'
+        )
+        if self._polygon_item:
+            poly_pen = QPen(self.box_color, 2, Qt.SolidLine)
+            poly_pen.setCosmetic(True)
+            self._polygon_item.setPen(poly_pen)
+            poly_fill = QColor(self.box_color)
+            poly_fill.setAlpha(95 if selected else 55)
+            self._polygon_item.setBrush(QBrush(poly_fill))
+
+    def add_polygon_overlay(self):
+        if not self.annotation.polygon:
+            return
+        scene = self.scene()
+        if not scene:
+            return
+        w, h = scene.sceneRect().width(), scene.sceneRect().height()
+        polygon = QPolygonF([QPointF(x * w, y * h) for x, y in self.annotation.polygon])
+        self._polygon_item = QGraphicsPolygonItem(polygon, self)
+        self._polygon_item.setAcceptedMouseButtons(Qt.NoButton)
+        self._polygon_item.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        self._polygon_item.setZValue(1)
+        self._apply_style(self.isSelected())
+
+    def _label_inner(self) -> str:
+        if self._is_provisional():
+            return f"{self.annotation.class_name} · {self.annotation.confidence:.0%} ⟳"
+        return self.annotation.class_name
 
     def _update_handle_positions(self):
         r = self.rect()
@@ -157,14 +191,30 @@ class BoundingBoxItem(QGraphicsRectItem):
             "bl": (r.left(), r.bottom()), "l": (r.left(), cy),
         }.items():
             self._handles[key].setPos(x, y)
+        self._label.setPos(r.topLeft())
+
+    def set_human(self):
+        """Aceptar la sugerencia: pasa a 'human'."""
+        self.annotation.source = "human"
+        self.annotation.confidence = 1.0
+        self._apply_style(self.isSelected())
+
+    def set_locked(self, locked: bool):
+        """Bloquear: no interactivo y atenuado (para dibujar sin interferencia)."""
+        self._locked = locked
+        self.setFlag(QGraphicsItem.ItemIsSelectable, not locked)
+        self.setAcceptedMouseButtons(Qt.NoButton if locked else Qt.AllButtons)
+        if locked:
+            self.setSelected(False)
+            for h in self._handles.values():
+                h.setVisible(False)
+        self.setOpacity(0.35 if locked else 1.0)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.ItemSelectedHasChanged:
             for h in self._handles.values():
                 h.setVisible(bool(value))
-            style = Qt.DashLine if self._is_yolo() else Qt.SolidLine
-            pen = QPen(self.box_color, 3 if value else 2, style)
-            self.setPen(pen)
+            self._apply_style(selected=bool(value))
         return super().itemChange(change, value)
 
     # ── Move logic (body drag) ──
@@ -195,20 +245,18 @@ class BoundingBoxItem(QGraphicsRectItem):
         super().mouseReleaseEvent(event)
 
     def _emit_changed(self):
-        if self._is_yolo():
+        if self._is_provisional():
+            # Editar una sugerencia equivale a aceptarla
             self.annotation.source = "human"
             self.annotation.confidence = 1.0
-            self._label.setPlainText(self._label_text())
-            self._apply_style()
+        self._apply_style(self.isSelected())
         if self.scene() and hasattr(self.scene(), "box_changed"):
             self.scene().box_changed(self)
 
     def update_class(self, name: str, color: QColor):
         self.annotation.class_name = name
         self.box_color = color
-        self._apply_style()
-        self._label.setPlainText(self._label_text())
-        self._label.setDefaultTextColor(color)
+        self._apply_style(self.isSelected())
 
 
 # ─────────────────────────── AnnotationScene ───────────────────────────
@@ -217,10 +265,12 @@ class AnnotationScene(QGraphicsScene):
     box_updated = Signal(object)          # Annotation
     box_deleted = Signal(object)          # Annotation
     class_change_requested = Signal(object)  # BoundingBoxItem
+    sam_point_clicked = Signal(float, float)  # punto (px, py) en coords de imagen
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._draw_mode = False
+        self._sam_mode = False
         self._drawing = False
         self._draw_start: QPointF | None = None
         self._temp_rect: QGraphicsRectItem | None = None
@@ -233,6 +283,16 @@ class AnnotationScene(QGraphicsScene):
         self._draw_mode = enabled
         if enabled:
             self.clearSelection()
+        # En modo dibujo, bloquear las cajas existentes para que no interfieran.
+        for box in self._boxes:
+            box.set_locked(enabled)
+
+    def set_sam_mode(self, enabled: bool):
+        self._sam_mode = enabled
+        if enabled:
+            self.clearSelection()
+        for box in self._boxes:
+            box.set_locked(enabled)
 
     def set_current_class(self, class_id: int, name: str, color: str):
         self._current_class_id = class_id
@@ -257,22 +317,34 @@ class AnnotationScene(QGraphicsScene):
                  color: QColor) -> BoundingBoxItem:
         box = BoundingBoxItem(rect, annotation, color)
         self.addItem(box)
+        box.add_polygon_overlay()
         self._boxes.append(box)
         return box
 
     # ── Mouse events ──
 
     def mousePressEvent(self, event):
+        if self._sam_mode and event.button() == Qt.LeftButton:
+            pos = event.scenePos()
+            if self.sceneRect().contains(pos):
+                self.sam_point_clicked.emit(pos.x(), pos.y())
+                event.accept()
+                return
         if self._draw_mode and event.button() == Qt.LeftButton:
             pos = event.scenePos()
             if self.sceneRect().contains(pos):
                 self._drawing = True
                 self._draw_start = pos
+                preview_pen = QPen(self._current_class_color, 2, Qt.DashLine)
+                preview_pen.setCosmetic(True)   # visible a cualquier zoom
+                preview_fill = QColor(self._current_class_color)
+                preview_fill.setAlpha(50)
                 self._temp_rect = self.addRect(
                     QRectF(pos, QSizeF(0, 0)),
-                    QPen(self._current_class_color, 1, Qt.DashLine),
-                    QBrush(Qt.NoBrush),
+                    preview_pen,
+                    QBrush(preview_fill),
                 )
+                self._temp_rect.setZValue(30)
                 event.accept()
                 return
         if event.button() == Qt.RightButton:
@@ -406,12 +478,54 @@ class AnnotationView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
 
+# ─────────────────────────── SAM interactivo (worker) ───────────────────────────
+
+class _SamWorker(QObject):
+    """Vive en un QThread; carga SAM2, codifica la imagen y predice por punto."""
+    loaded      = Signal()
+    image_ready = Signal()
+    box_ready   = Signal(object)   # dict {box, polygon} o None
+    failed      = Signal(str)
+
+    def __init__(self, model_name: str):
+        super().__init__()
+        self._model_name = model_name
+        self._sam = None
+
+    def load(self):
+        try:
+            from ..core.interactive_sam import InteractiveSAM
+            self._sam = InteractiveSAM(self._model_name)
+            self._sam.load()
+            self.loaded.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def set_image(self, path: str):
+        try:
+            self._sam.set_image(path)
+            self.image_ready.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def predict(self, px: float, py: float):
+        try:
+            self.box_ready.emit(self._sam.predict_point(px, py))
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 # ─────────────────────────── AnnotationEditor ───────────────────────────
 
 class AnnotationEditor(QWidget):
     annotation_saved     = Signal(int)
     navigate_request     = Signal(int)
     image_status_changed = Signal(int, str)  # image_id, new_status
+
+    # Solicitudes al worker SAM (cruzan al hilo del worker)
+    _sam_load_requested    = Signal()
+    _sam_image_requested   = Signal(str)
+    _sam_predict_requested = Signal(float, float)
 
     _PIXMAP_CACHE_SIZE = 8
     _MAX_UNDO = 30
@@ -426,14 +540,27 @@ class AnnotationEditor(QWidget):
         self._pixmap_cache_order: list[str] = []       # LRU order
         self._undo_stack: list[list] = []   # list of annotation snapshots
         self._redo_stack: list[list] = []
+        self._syncing = False   # guarda contra recursión list↔scene
+
+        # SAM interactivo (click-to-box)
+        self._sam_model_name = DEFAULT_INTERACTIVE_SAM_MODEL
+        self._sam_thread: QThread | None = None
+        self._sam_worker: _SamWorker | None = None
+        self._sam_loaded = False
+        self._sam_image_path: str | None = None   # imagen ya codificada en SAM
+        self._sam_pending_image: str | None = None
+        self._sam_busy = False
 
         # Create scene and view first — _build_toolbar references self._view
         self._scene = AnnotationScene()
         self._scene.box_updated.connect(self._on_box_updated)
         self._scene.box_deleted.connect(self._on_box_deleted)
         self._scene.class_change_requested.connect(self._show_class_menu_for_box)
+        self._scene.selectionChanged.connect(self._on_scene_selection_changed)
+        self._scene.sam_point_clicked.connect(self._on_sam_point)
         self._view = AnnotationView(self._scene)
         self._view.installEventFilter(self)   # intercept arrow keys
+        self._view.setFocusPolicy(Qt.StrongFocus)   # poder recibir foco de teclado
 
         self._setup_ui()
 
@@ -485,7 +612,7 @@ class AnnotationEditor(QWidget):
         hint = QLabel(
             "← / → navegar imágenes\n"
             "R → revisada   X → descartar\n"
-            "D → modo dibujo\n"
+            "D → modo dibujo   S → SAM click   A → aceptar sugerencias\n"
             "F → ajustar vista\n"
             "Del → borrar bbox seleccionado\n"
             "Ctrl+S → guardar manual\n"
@@ -499,12 +626,48 @@ class AnnotationEditor(QWidget):
         hint.setWordWrap(True)
         right_layout.addWidget(hint)
 
+        # ── Visibilidad / filtro de clases ──
+        self._show_labels_cb = QCheckBox("Mostrar etiquetas en imagen")
+        self._show_labels_cb.setChecked(True)
+        self._show_labels_cb.setToolTip(
+            "Apagar todas las etiquetas sobre la imagen para ver la foto limpia")
+        self._show_labels_cb.toggled.connect(self._apply_visibility)
+        right_layout.addWidget(self._show_labels_cb)
+
+        right_layout.addWidget(QLabel("Filtrar clases:"))
+        self._filter_list = QListWidget()
+        self._filter_list.setMaximumHeight(96)
+        self._filter_list.setToolTip(
+            "Tildá las clases a mostrar (afecta la imagen y la lista de abajo)")
+        self._filter_list.itemChanged.connect(self._on_filter_item_changed)
+        right_layout.addWidget(self._filter_list)
+
         right_layout.addWidget(QLabel("Anotaciones:"))
         self._ann_list = QListWidget()
+        self._ann_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._ann_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self._ann_list.customContextMenuRequested.connect(self._ann_context_menu)
-        self._ann_list.itemClicked.connect(self._on_ann_list_clicked)
+        self._ann_list.itemSelectionChanged.connect(self._sync_list_to_scene)
         right_layout.addWidget(self._ann_list)
+
+        # Validación rápida de sugerencias de IA (SAM 3 / YOLOE)
+        sugg_row = QHBoxLayout()
+        self._accept_all_btn = QPushButton("✓ Aceptar sugerencias")
+        self._accept_all_btn.setStyleSheet("background: #1a6e2e; font-weight: bold;")
+        self._accept_all_btn.setToolTip(
+            "Aceptar las sugerencias seleccionadas, o todas si no hay selección [A]")
+        self._accept_all_btn.clicked.connect(self._accept_suggestions)
+        self._accept_all_btn.setVisible(False)
+        sugg_row.addWidget(self._accept_all_btn)
+
+        self._reject_all_btn = QPushButton("✗ Rechazar")
+        self._reject_all_btn.setStyleSheet("background: #5c1a1a; font-weight: bold;")
+        self._reject_all_btn.setToolTip(
+            "Rechazar las sugerencias seleccionadas, o todas si no hay selección")
+        self._reject_all_btn.clicked.connect(self._reject_suggestions)
+        self._reject_all_btn.setVisible(False)
+        sugg_row.addWidget(self._reject_all_btn)
+        right_layout.addLayout(sugg_row)
 
         del_btn = QPushButton("Borrar seleccionado  [Del]")
         del_btn.clicked.connect(self._delete_selected_annotation)
@@ -539,6 +702,17 @@ class AnnotationEditor(QWidget):
         self._draw_btn.setToolTip("Activar modo dibujo: click+drag para crear bbox")
         self._draw_btn.toggled.connect(self._toggle_draw_mode)
         row.addWidget(self._draw_btn)
+
+        self._sam_btn = QPushButton("🪄 SAM click [S]")
+        self._sam_btn.setCheckable(True)
+        self._sam_btn.setToolTip("Click sobre un objeto y SAM2 propone la caja ajustada")
+        self._sam_btn.toggled.connect(self._toggle_sam_mode)
+        row.addWidget(self._sam_btn)
+
+        self._mode_label = QLabel()
+        self._mode_label.setMinimumWidth(230)
+        row.addWidget(self._mode_label)
+        self._update_mode_label()
 
         fit_btn = QPushButton("Ajustar [F]")
         fit_btn.clicked.connect(self._view.fit_in_view)
@@ -586,7 +760,42 @@ class AnnotationEditor(QWidget):
             self._classes[class_id] = (name, color)
             self._class_combo.addItem(name, (class_id, name, color))
         self._class_combo.blockSignals(False)
+        self._populate_filter_list()
         self._update_scene_class()
+
+    # ── Visibilidad / filtro por clase ──
+
+    def _populate_filter_list(self):
+        self._filter_list.blockSignals(True)
+        self._filter_list.clear()
+        for class_id, (name, color) in self._classes.items():
+            item = QListWidgetItem(name)
+            pix = QPixmap(12, 12)
+            pix.fill(QColor(color))
+            item.setIcon(QIcon(pix))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            item.setData(Qt.UserRole, class_id)
+            self._filter_list.addItem(item)
+        self._filter_list.blockSignals(False)
+
+    def _class_visible(self, class_id: int) -> bool:
+        if self._filter_list.count() == 0:
+            return True
+        for row in range(self._filter_list.count()):
+            it = self._filter_list.item(row)
+            if it.data(Qt.UserRole) == class_id:
+                return it.checkState() == Qt.Checked
+        return True
+
+    def _apply_visibility(self):
+        """Aplica el checkbox maestro + filtro de clases a las cajas del lienzo."""
+        show = self._show_labels_cb.isChecked()
+        for box in self._scene._boxes:
+            box.setVisible(show and self._class_visible(box.annotation.class_id))
+
+    def _on_filter_item_changed(self, _item):
+        self._refresh_ann_list()   # refresca lista (respeta filtro) + visibilidad
 
     def _update_scene_class(self):
         idx = self._class_combo.currentIndex()
@@ -602,7 +811,8 @@ class AnnotationEditor(QWidget):
 
     def _snapshot(self) -> list:
         return [
-            (a.class_id, a.class_name, a.x, a.y, a.width, a.height, a.source, a.confidence)
+            (a.class_id, a.class_name, a.x, a.y, a.width, a.height,
+             a.source, a.confidence, a.polygon)
             for a in self._pending_annotations
         ]
 
@@ -616,7 +826,8 @@ class AnnotationEditor(QWidget):
     def _restore_snapshot(self, snapshot: list):
         self._pending_annotations = [
             Annotation(class_id=s[0], class_name=s[1], x=s[2], y=s[3],
-                       width=s[4], height=s[5], source=s[6], confidence=s[7])
+                       width=s[4], height=s[5], source=s[6], confidence=s[7],
+                       polygon=s[8] if len(s) > 8 else None)
             for s in snapshot
         ]
         if self._image:
@@ -688,6 +899,11 @@ class AnnotationEditor(QWidget):
 
         self._refresh_ann_list()
         self._view.fit_in_view()
+        # Garantizar que el canvas tenga el foco para que ← → R X funcionen
+        self._view.setFocus(Qt.OtherFocusReason)
+        # Si el modo SAM está activo, re-codificar la nueva imagen
+        if self._sam_btn.isChecked():
+            self._sam_request_current_image()
 
     # ── Box events ──
 
@@ -712,28 +928,89 @@ class AnnotationEditor(QWidget):
     # ── Annotation list ──
 
     def _refresh_ann_list(self):
+        self._ann_list.blockSignals(True)
         self._ann_list.clear()
         for ann in self._pending_annotations:
-            tag = f" [YOLO {ann.confidence:.0%}]" if ann.source == "yolo" else ""
-            item = QListWidgetItem(
-                f"{ann.class_name}{tag}  [{ann.x:.2f},{ann.y:.2f}  {ann.width:.2f}×{ann.height:.2f}]"
-            )
-            if ann.source == "yolo":
-                item.setForeground(QColor("#aaaaff"))
+            if not self._class_visible(ann.class_id):
+                continue
+            provisional = ann.source != "human"
+            color = self._classes.get(ann.class_id, (ann.class_name, "#FF0000"))[1]
+            if provisional:
+                label = f"⟳ {ann.class_name}  ·  {ann.confidence:.0%}"
+            else:
+                label = f"✓ {ann.class_name}"
+            item = QListWidgetItem(label)
+            # Punto de color de la clase para distinguir etiquetas de un vistazo
+            pix = QPixmap(12, 12)
+            pix.fill(QColor(color))
+            item.setIcon(QIcon(pix))
+            if provisional:
+                item.setForeground(QColor("#ffcf66"))   # ámbar = pendiente de validar
             item.setData(Qt.UserRole, ann)
             self._ann_list.addItem(item)
+        self._ann_list.blockSignals(False)
+        self._apply_visibility()
+        self._update_suggestion_buttons()
 
-    def _on_ann_list_clicked(self, item: QListWidgetItem):
-        ann = item.data(Qt.UserRole)
-        if not ann:
-            return
-        # Select the corresponding box in the scene
-        self._scene.clearSelection()
+    def _box_for_ann(self, ann):
         for box in self._scene._boxes:
             if box.annotation is ann:
-                box.setSelected(True)
-                self._view.ensureVisible(box)
-                break
+                return box
+        return None
+
+    def _selected_provisional(self) -> list:
+        """Sugerencias actualmente seleccionadas en el lienzo."""
+        return [b.annotation for b in self._scene.selectedItems()
+                if isinstance(b, BoundingBoxItem) and b.annotation.source != "human"]
+
+    def _all_provisional(self) -> list:
+        return [a for a in self._pending_annotations if a.source != "human"]
+
+    def _sync_list_to_scene(self):
+        """Selección en la lista → seleccionar las cajas correspondientes."""
+        if self._syncing:
+            return
+        self._syncing = True
+        sel_ids = {id(it.data(Qt.UserRole)) for it in self._ann_list.selectedItems()}
+        first_box = None
+        for box in self._scene._boxes:
+            on = id(box.annotation) in sel_ids
+            box.setSelected(on)
+            if on and first_box is None:
+                first_box = box
+        if first_box:
+            self._view.ensureVisible(first_box)
+        self._syncing = False
+        self._update_suggestion_buttons()
+
+    def _on_scene_selection_changed(self):
+        """Selección en el lienzo → resaltar las filas correspondientes."""
+        if self._syncing:
+            self._update_suggestion_buttons()
+            return
+        self._syncing = True
+        sel_ids = {id(i.annotation) for i in self._scene.selectedItems()
+                   if isinstance(i, BoundingBoxItem)}
+        for row in range(self._ann_list.count()):
+            it = self._ann_list.item(row)
+            it.setSelected(id(it.data(Qt.UserRole)) in sel_ids)
+        self._syncing = False
+        self._update_suggestion_buttons()
+
+    def _update_suggestion_buttons(self):
+        total = self._all_provisional()
+        has = bool(total)
+        self._accept_all_btn.setVisible(has)
+        self._reject_all_btn.setVisible(has)
+        if not has:
+            return
+        sel = self._selected_provisional()
+        if sel:
+            self._accept_all_btn.setText(f"✓ Aceptar selección ({len(sel)})")
+            self._reject_all_btn.setText(f"✗ Rechazar ({len(sel)})")
+        else:
+            self._accept_all_btn.setText(f"✓ Aceptar todas ({len(total)})")
+            self._reject_all_btn.setText("✗ Rechazar todas")
 
     def _ann_context_menu(self, pos):
         item = self._ann_list.itemAt(pos)
@@ -741,6 +1018,10 @@ class AnnotationEditor(QWidget):
             return
         ann = item.data(Qt.UserRole)
         menu = QMenu(self)
+        if ann.source != "human":
+            menu.addAction("✓ Aceptar sugerencia", lambda: self._accept_ann(ann))
+            menu.addAction("✗ Rechazar sugerencia", lambda: self._delete_ann(ann))
+            menu.addSeparator()
         change_menu = menu.addMenu("Cambiar clase")
         for class_id, (name, color) in self._classes.items():
             action = change_menu.addAction(name)
@@ -755,6 +1036,48 @@ class AnnotationEditor(QWidget):
         menu.addSeparator()
         menu.addAction("Borrar", lambda: self._delete_ann(ann))
         menu.exec(self._ann_list.mapToGlobal(pos))
+
+    def _accept_ann(self, ann: Annotation):
+        if ann.source == "human":
+            return
+        self._push_undo()
+        ann.source = "human"
+        ann.confidence = 1.0
+        box = self._box_for_ann(ann)
+        if box:
+            box.set_human()
+        self._refresh_ann_list()
+        if self._autosave_cb.isChecked():
+            self.save_annotations()
+
+    def _accept_suggestions(self):
+        """Aceptar las sugerencias seleccionadas; si no hay selección, todas."""
+        targets = self._selected_provisional() or self._all_provisional()
+        if not targets:
+            return
+        self._push_undo()
+        for ann in targets:
+            ann.source = "human"
+            ann.confidence = 1.0
+            box = self._box_for_ann(ann)
+            if box:
+                box.set_human()
+        self._refresh_ann_list()
+        if self._autosave_cb.isChecked():
+            self.save_annotations()
+        self._status_label.setText(f"{len(targets)} sugerencia(s) aceptada(s)")
+
+    def _reject_suggestions(self):
+        """Rechazar las sugerencias seleccionadas; si no hay selección, todas."""
+        targets = self._selected_provisional() or self._all_provisional()
+        if not targets:
+            return
+        self._push_undo()
+        for ann in list(targets):
+            self._delete_ann(ann, push_undo=False)
+        if self._autosave_cb.isChecked():
+            self.save_annotations()
+        self._status_label.setText(f"{len(targets)} sugerencia(s) rechazada(s)")
 
     def _show_class_menu_for_box(self, box: "BoundingBoxItem"):
         """Context menu triggered by right-click on a bbox in the canvas."""
@@ -801,7 +1124,9 @@ class AnnotationEditor(QWidget):
         if ann:
             self._delete_ann(ann)
 
-    def _delete_ann(self, ann: Annotation):
+    def _delete_ann(self, ann: Annotation, push_undo: bool = False):
+        if push_undo:
+            self._push_undo()
         if ann in self._pending_annotations:
             self._pending_annotations.remove(ann)
         if ann.id and self._db:
@@ -823,7 +1148,7 @@ class AnnotationEditor(QWidget):
             new_id = self._db.insert_annotation(
                 self._image.id, ann.class_id,
                 ann.x, ann.y, ann.width, ann.height,
-                ann.source, ann.confidence,
+                ann.source, ann.confidence, polygon=ann.polygon,
             )
             ann.id = new_id
         self.annotation_saved.emit(self._image.id)
@@ -832,11 +1157,137 @@ class AnnotationEditor(QWidget):
     # ── Draw mode / status ──
 
     def _toggle_draw_mode(self, enabled: bool):
+        if enabled and self._sam_btn.isChecked():
+            self._sam_btn.setChecked(False)   # exclusión mutua (dispara su toggle)
         self._scene.set_draw_mode(enabled)
         # In draw mode disable rubber band so clicks go to scene for drawing
         self._view.setDragMode(
             QGraphicsView.NoDrag if enabled else QGraphicsView.RubberBandDrag
         )
+        self._update_mode_label()
+
+    def _update_mode_label(self):
+        if self._sam_btn.isChecked():
+            self._mode_label.setText("🪄  MODO SAM — click sobre un objeto para crear bbox")
+            self._mode_label.setStyleSheet(
+                "background:#5a2a8a; color:#fff; font-weight:bold;"
+                " border-radius:3px; padding:3px 8px;")
+        elif self._draw_btn.isChecked():
+            self._mode_label.setText("✏️  MODO DIBUJO — click y arrastrá para crear bbox")
+            self._mode_label.setStyleSheet(
+                "background:#8a5a00; color:#fff; font-weight:bold;"
+                " border-radius:3px; padding:3px 8px;")
+        else:
+            self._mode_label.setText("↔  MODO EDICIÓN — click para seleccionar / mover")
+            self._mode_label.setStyleSheet(
+                "background:#234e7a; color:#fff; font-weight:bold;"
+                " border-radius:3px; padding:3px 8px;")
+
+    # ── SAM interactivo (click-to-box) ──
+
+    def _toggle_sam_mode(self, enabled: bool):
+        if enabled and self._draw_btn.isChecked():
+            self._draw_btn.setChecked(False)
+        self._scene.set_sam_mode(enabled)
+        self._view.setDragMode(
+            QGraphicsView.NoDrag if enabled else QGraphicsView.RubberBandDrag
+        )
+        if enabled:
+            self._ensure_sam_thread()
+            if self._sam_loaded:
+                self._sam_request_current_image()
+            else:
+                self._status_label.setText("SAM: cargando modelo (primera vez descarga)...")
+        self._update_mode_label()
+
+    def _ensure_sam_thread(self):
+        if self._sam_thread is not None:
+            return
+        self._sam_thread = QThread()
+        self._sam_worker = _SamWorker(self._sam_model_name)
+        self._sam_worker.moveToThread(self._sam_thread)
+        self._sam_load_requested.connect(self._sam_worker.load)
+        self._sam_image_requested.connect(self._sam_worker.set_image)
+        self._sam_predict_requested.connect(self._sam_worker.predict)
+        self._sam_worker.loaded.connect(self._on_sam_loaded)
+        self._sam_worker.image_ready.connect(self._on_sam_image_ready)
+        self._sam_worker.box_ready.connect(self._on_sam_box_ready)
+        self._sam_worker.failed.connect(self._on_sam_failed)
+        self._sam_thread.start()
+        self._sam_load_requested.emit()
+
+    def _sam_request_current_image(self):
+        if not self._sam_loaded or self._image is None:
+            return
+        path = self._image.path
+        if self._sam_image_path == path and not self._sam_busy:
+            self._status_label.setText("SAM: clickeá un objeto")
+            return
+        self._sam_pending_image = path
+        self._sam_busy = True
+        self._status_label.setText("SAM: preparando imagen...")
+        self._sam_image_requested.emit(path)
+
+    def _on_sam_loaded(self):
+        self._sam_loaded = True
+        if self._sam_btn.isChecked() and self._image is not None:
+            self._sam_request_current_image()
+
+    def _on_sam_image_ready(self):
+        self._sam_image_path = self._sam_pending_image
+        self._sam_busy = False
+        self._status_label.setText("SAM: clickeá un objeto")
+
+    def _on_sam_point(self, px: float, py: float):
+        if not self._sam_btn.isChecked():
+            return
+        if not self._sam_loaded:
+            self._status_label.setText("SAM: cargando modelo, esperá...")
+            return
+        if self._image is not None and self._sam_image_path != self._image.path:
+            self._sam_request_current_image()
+            return
+        if self._sam_busy:
+            return
+        self._sam_busy = True
+        self._status_label.setText("SAM: segmentando...")
+        self._sam_predict_requested.emit(px, py)
+
+    def _on_sam_box_ready(self, res):
+        self._sam_busy = False
+        if not res:
+            self._status_label.setText("SAM: no se encontró objeto en ese punto")
+            return
+        self._add_sam_box(res["box"], res.get("polygon"))
+        self._status_label.setText("SAM: caja creada ✓")
+
+    def _on_sam_failed(self, msg: str):
+        self._sam_busy = False
+        self._status_label.setText(f"SAM error: {msg[:80]}")
+
+    def _add_sam_box(self, box, polygon):
+        if self._image is None:
+            return
+        x, y, bw, bh = box
+        cid = self._scene._current_class_id
+        name = self._scene._current_class_name
+        color = self._scene._current_class_color
+        ann = Annotation(class_id=cid, class_name=name, x=x, y=y,
+                         width=bw, height=bh, source="human", confidence=1.0,
+                         polygon=polygon)
+        w = self._scene.sceneRect().width()
+        h = self._scene.sceneRect().height()
+        rect = QRectF(x * w, y * h, bw * w, bh * h)
+        box_item = self._scene._add_box(rect, ann, QColor(color))
+        box_item.add_polygon_overlay()
+        self._on_box_updated(ann)     # push undo + append + refresh + autosave
+        box_item.setSelected(True)
+
+    def shutdown_sam(self):
+        if self._sam_thread is not None:
+            self._sam_thread.quit()
+            self._sam_thread.wait(3000)
+            self._sam_thread = None
 
     def _set_image_status(self, status: str):
         if self._image and self._db:
@@ -866,6 +1317,15 @@ class AnnotationEditor(QWidget):
             if event.key() == Qt.Key_X:
                 self._set_image_status("discarded")
                 return True
+            if event.key() == Qt.Key_A:
+                self._accept_suggestions()
+                return True
+            if event.key() == Qt.Key_D:
+                self._draw_btn.setChecked(not self._draw_btn.isChecked())
+                return True
+            if event.key() == Qt.Key_S and not (event.modifiers() & Qt.ControlModifier):
+                self._sam_btn.setChecked(not self._sam_btn.isChecked())
+                return True
             if event.matches(QKeySequence.Undo):
                 self.undo()
                 return True
@@ -885,6 +1345,10 @@ class AnnotationEditor(QWidget):
             self._set_image_status("discarded")
         elif event.key() == Qt.Key_D:
             self._draw_btn.setChecked(not self._draw_btn.isChecked())
+        elif event.key() == Qt.Key_S and not (event.modifiers() & Qt.ControlModifier):
+            self._sam_btn.setChecked(not self._sam_btn.isChecked())
+        elif event.key() == Qt.Key_A:
+            self._accept_suggestions()
         elif event.key() == Qt.Key_F:
             self._view.fit_in_view()
         elif event.matches(QKeySequence.Save):

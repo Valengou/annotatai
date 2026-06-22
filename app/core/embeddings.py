@@ -87,3 +87,40 @@ class EmbeddingGenerator:
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
+
+
+def generate_project_embeddings(
+    db,
+    backend,
+    model_name: str | None = None,
+    progress_callback: Callable | None = None,
+) -> int:
+    rows = db.get_all_images()
+    total = len(rows)
+    target_model = model_name or backend.name
+    pending = [row for row in rows if not db.has_embedding(row[0], target_model)]
+
+    if not pending:
+        if progress_callback:
+            progress_callback(total, total)
+        return 0
+
+    image_paths = [Path(row[1]) for row in pending]
+
+    def on_backend_progress(done: int, backend_total: int):
+        if progress_callback:
+            progress_callback(done, backend_total)
+
+    vectors = backend.embed_paths(image_paths, progress_callback=on_backend_progress)
+    for row, vector in zip(pending, vectors):
+        image_id = row[0]
+        db.save_embedding(
+            image_id,
+            np.asarray(vector, dtype=np.float32).tobytes(),
+            target_model,
+        )
+        db.mark_embedding_ready(image_id)
+
+    if progress_callback:
+        progress_callback(total, total)
+    return len(pending)

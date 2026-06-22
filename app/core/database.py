@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
@@ -67,6 +68,12 @@ CREATE TABLE IF NOT EXISTS annotations (
     FOREIGN KEY (class_id) REFERENCES classes(id)
 );
 
+CREATE TABLE IF NOT EXISTS annotation_polygons (
+    annotation_id INTEGER PRIMARY KEY,
+    points_json TEXT NOT NULL,
+    FOREIGN KEY (annotation_id) REFERENCES annotations(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS bbox_embeddings (
     annotation_id INTEGER PRIMARY KEY,
     vector BLOB NOT NULL,
@@ -80,6 +87,13 @@ CREATE TABLE IF NOT EXISTS bbox_projections (
     y REAL NOT NULL,
     outlier_score REAL DEFAULT 0.0,
     FOREIGN KEY (annotation_id) REFERENCES annotations(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS search_embeddings (
+    image_id INTEGER PRIMARY KEY,
+    vector BLOB NOT NULL,
+    model TEXT NOT NULL,
+    FOREIGN KEY (image_id) REFERENCES images(id) ON DELETE CASCADE
 );
 """
 
@@ -175,6 +189,45 @@ class Database:
         with self.cursor() as cur:
             cur.execute("UPDATE images SET embedding_ready=1 WHERE id=?", (image_id,))
 
+    # --- Search embeddings (SigLIP2, separados de los de clustering) ---
+
+    def save_search_embedding(self, image_id: int, vector_bytes: bytes, model: str):
+        with self.cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO search_embeddings (image_id, vector, model) "
+                "VALUES (?, ?, ?)",
+                (image_id, vector_bytes, model),
+            )
+
+    def has_search_embedding(self, image_id: int, model: str) -> bool:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM search_embeddings WHERE image_id=? AND model=?",
+                (image_id, model))
+            return cur.fetchone() is not None
+
+    def count_search_embeddings(self, model: str | None = None) -> int:
+        with self.cursor() as cur:
+            if model is None:
+                cur.execute("SELECT COUNT(*) FROM search_embeddings")
+            else:
+                cur.execute("SELECT COUNT(*) FROM search_embeddings WHERE model=?", (model,))
+            return cur.fetchone()[0]
+
+    def get_all_search_embeddings(self, model: str) -> list:
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT image_id, vector FROM search_embeddings WHERE model=? "
+                "ORDER BY image_id", (model,))
+            return cur.fetchall()
+
+    def clear_search_embeddings(self, model: str | None = None):
+        with self.cursor() as cur:
+            if model is None:
+                cur.execute("DELETE FROM search_embeddings")
+            else:
+                cur.execute("DELETE FROM search_embeddings WHERE model=?", (model,))
+
     # --- BBox embeddings ---
 
     def count_bbox_embeddings(self) -> int:
@@ -263,6 +316,52 @@ class Database:
             """)
             return cur.fetchall()
 
+    def get_boxes_for_class(self, class_id: int, source: str = "human") -> list:
+        """Cajas de una clase, con path y tamaño de imagen.
+        Filas: (image_id, path, img_w, img_h, x, y, w, h)."""
+        with self.cursor() as cur:
+            cur.execute("""
+                SELECT a.image_id, i.path, i.width, i.height,
+                       a.x, a.y, a.width, a.height
+                FROM annotations a
+                JOIN images i ON i.id = a.image_id
+                WHERE a.class_id = ? AND a.source = ?
+            """, (class_id, source))
+            return cur.fetchall()
+
+    def count_human_boxes_per_image(self) -> dict:
+        """{image_id: n_cajas_humanas}."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT image_id, COUNT(*) FROM annotations "
+                "WHERE source='human' GROUP BY image_id"
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+    def count_human_boxes_per_class(self) -> dict:
+        """{class_id: n_cajas_humanas} para elegir clases con exemplar disponible."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT class_id, COUNT(*) FROM annotations "
+                "WHERE source='human' GROUP BY class_id"
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+    def get_human_classes_in_cluster(self, cluster_id: int) -> list:
+        """Clases con cajas humanas en imágenes de un cluster.
+        Filas: (class_id, name, n_cajas)."""
+        with self.cursor() as cur:
+            cur.execute("""
+                SELECT a.class_id, c.name, COUNT(*)
+                FROM annotations a
+                JOIN images i ON i.id = a.image_id
+                JOIN classes c ON c.id = a.class_id
+                WHERE i.cluster_id = ? AND a.source = 'human'
+                GROUP BY a.class_id, c.name
+                ORDER BY COUNT(*) DESC
+            """, (cluster_id,))
+            return cur.fetchall()
+
     # --- Image deletion ---
 
     def delete_images(self, image_ids: list[int]) -> int:
@@ -293,9 +392,12 @@ class Database:
             cur.execute("SELECT COUNT(*) FROM images")
             return cur.fetchone()[0]
 
-    def count_embeddings(self) -> int:
+    def count_embeddings(self, model: str | None = None) -> int:
         with self.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM embeddings")
+            if model is None:
+                cur.execute("SELECT COUNT(*) FROM embeddings")
+            else:
+                cur.execute("SELECT COUNT(*) FROM embeddings WHERE model=?", (model,))
             return cur.fetchone()[0]
 
     # --- Clusters ---
@@ -348,9 +450,15 @@ class Database:
             )
             return cur.fetchall()
 
-    def has_embedding(self, image_id: int) -> bool:
+    def has_embedding(self, image_id: int, model: str | None = None) -> bool:
         with self.cursor() as cur:
-            cur.execute("SELECT 1 FROM embeddings WHERE image_id=?", (image_id,))
+            if model is None:
+                cur.execute("SELECT 1 FROM embeddings WHERE image_id=?", (image_id,))
+            else:
+                cur.execute(
+                    "SELECT 1 FROM embeddings WHERE image_id=? AND model=?",
+                    (image_id, model),
+                )
             return cur.fetchone() is not None
 
     # --- Projections ---
@@ -404,14 +512,37 @@ class Database:
 
     def insert_annotation(self, image_id: int, class_id: int,
                           x: float, y: float, w: float, h: float,
-                          source: str = "human", confidence: float = 1.0) -> int:
+                          source: str = "human", confidence: float = 1.0,
+                          polygon: list[tuple[float, float]] | None = None) -> int:
         with self.cursor() as cur:
             cur.execute(
                 "INSERT INTO annotations (image_id, class_id, x, y, width, height, source, confidence) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (image_id, class_id, x, y, w, h, source, confidence),
             )
-            return cur.lastrowid
+            ann_id = cur.lastrowid
+            if polygon:
+                cur.execute(
+                    "INSERT INTO annotation_polygons (annotation_id, points_json) VALUES (?, ?)",
+                    (ann_id, json.dumps(polygon)),
+                )
+            return ann_id
+
+    def update_annotation_source(self, ann_id: int, source: str,
+                                 confidence: float | None = None):
+        with self.cursor() as cur:
+            if confidence is None:
+                cur.execute("UPDATE annotations SET source=? WHERE id=?",
+                            (source, ann_id))
+            else:
+                cur.execute(
+                    "UPDATE annotations SET source=?, confidence=? WHERE id=?",
+                    (source, confidence, ann_id))
+
+    def update_review_sort_confidence(self, image_id: int, value: float | None):
+        with self.cursor() as cur:
+            cur.execute("UPDATE images SET review_sort_confidence=? WHERE id=?",
+                        (value, image_id))
 
     def update_annotation(self, ann_id: int, class_id: int,
                           x: float, y: float, w: float, h: float):
@@ -429,8 +560,9 @@ class Database:
         with self.cursor() as cur:
             cur.execute(
                 "SELECT a.id, a.image_id, a.class_id, c.name, a.x, a.y, a.width, a.height, "
-                "a.source, a.confidence "
+                "a.source, a.confidence, p.points_json "
                 "FROM annotations a JOIN classes c ON c.id=a.class_id "
+                "LEFT JOIN annotation_polygons p ON p.annotation_id=a.id "
                 "WHERE a.image_id=? ORDER BY a.id",
                 (image_id,),
             )
@@ -439,3 +571,41 @@ class Database:
     def delete_annotations_for_image(self, image_id: int):
         with self.cursor() as cur:
             cur.execute("DELETE FROM annotations WHERE image_id=?", (image_id,))
+
+    def delete_annotations_by_source(self, image_id: int, source: str):
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM annotations WHERE image_id=? AND source=?",
+                (image_id, source),
+            )
+
+    def get_images_by_status(self, status: str) -> list:
+        """(id, path, filename) de imágenes en un estado dado."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT id, path, filename FROM images WHERE status=? ORDER BY filename",
+                (status,),
+            )
+            return cur.fetchall()
+
+    def count_human_boxes_in_reviewed_per_class(self) -> dict:
+        """{class_id: n_cajas_humanas} contando solo imágenes revisadas (lo que se
+        exporta al entrenar)."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT a.class_id, COUNT(*) FROM annotations a "
+                "JOIN images i ON i.id=a.image_id "
+                "WHERE a.source='human' AND i.status='reviewed' "
+                "GROUP BY a.class_id"
+            )
+            return {row[0]: row[1] for row in cur.fetchall()}
+
+    def count_reviewed_with_boxes(self) -> int:
+        """Imágenes revisadas que tienen al menos una caja humana."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(DISTINCT i.id) FROM images i "
+                "JOIN annotations a ON a.image_id=i.id "
+                "WHERE i.status='reviewed' AND a.source='human'"
+            )
+            return cur.fetchone()[0]
