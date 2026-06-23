@@ -365,6 +365,7 @@ class ImageGrid(QWidget):
         self._sort_mode = "filename"
         self._confidence_filter = "all"
         self._confidence_threshold = 0.50
+        self._annotation_filter = "all"   # all | with | without
         self._setup_ui()
 
     def _setup_ui(self):
@@ -439,6 +440,19 @@ class ImageGrid(QWidget):
         self._confidence_spin.setToolTip("Umbral de confianza para filtrar imagenes dudosas")
         self._confidence_spin.valueChanged.connect(self._on_confidence_threshold_changed)
         sort_layout.addWidget(self._confidence_spin)
+
+        ann_label = QLabel("Anotaciones:")
+        ann_label.setStyleSheet("color:#999; font-size:11px; margin-left:12px;")
+        sort_layout.addWidget(ann_label)
+        self._annotation_combo = QComboBox()
+        self._annotation_combo.addItem("Todas", "all")
+        self._annotation_combo.addItem("Con anotaciones", "with")
+        self._annotation_combo.addItem("Sin anotaciones", "without")
+        self._annotation_combo.setToolTip(
+            "Filtrar por presencia de cajas/etiquetas (humanas o sugeridas)")
+        self._annotation_combo.currentIndexChanged.connect(self._on_annotation_filter_changed)
+        sort_layout.addWidget(self._annotation_combo)
+
         sort_layout.addStretch()
         outer.addWidget(sort_bar)
 
@@ -592,6 +606,10 @@ class ImageGrid(QWidget):
         self._confidence_filter = self._confidence_combo.currentData() or "all"
         self._apply_filters()
 
+    def _on_annotation_filter_changed(self):
+        self._annotation_filter = self._annotation_combo.currentData() or "all"
+        self._apply_filters()
+
     def _on_confidence_threshold_changed(self, value: float):
         self._confidence_threshold = float(value)
         self._apply_filters()
@@ -633,7 +651,12 @@ class ImageGrid(QWidget):
                 for ann in anns
             )
         confidence_ok = self._confidence_filter_ok(card.image)
-        return cluster_ok and status_ok and class_ok and confidence_ok
+        if self._annotation_filter == "all":
+            annotation_ok = True
+        else:
+            has_ann = bool(self._ann_cache.get(img_id))
+            annotation_ok = has_ann if self._annotation_filter == "with" else not has_ann
+        return cluster_ok and status_ok and class_ok and confidence_ok and annotation_ok
 
     def _apply_filters(self):
         self._visible_ids.clear()

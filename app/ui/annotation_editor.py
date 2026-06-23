@@ -618,7 +618,8 @@ class AnnotationEditor(QWidget):
             "Ctrl+S → guardar manual\n"
             "Ctrl+Z → deshacer\n"
             "Ctrl+Y → rehacer\n"
-            "Click → seleccionar bbox\n"
+            "Click → seleccionar bbox  (Ctrl/Shift → varias)\n"
+            "Clic derecho en la lista → cambiar clase / borrar en lote\n"
             "Arrastrar vértice → redimensionar\n"
             "Rueda → zoom   Medio → pan"
         )
@@ -1012,30 +1013,99 @@ class AnnotationEditor(QWidget):
             self._accept_all_btn.setText(f"✓ Aceptar todas ({len(total)})")
             self._reject_all_btn.setText("✗ Rechazar todas")
 
+    def _selected_annotations(self) -> list:
+        """Anotaciones seleccionadas en la lista (sincronizada con el lienzo)."""
+        return [it.data(Qt.UserRole) for it in self._ann_list.selectedItems()]
+
     def _ann_context_menu(self, pos):
         item = self._ann_list.itemAt(pos)
         if not item:
             return
-        ann = item.data(Qt.UserRole)
+        clicked = item.data(Qt.UserRole)
+        selected = self._selected_annotations()
+        # Si el clickeado forma parte de una selección múltiple, operar sobre toda
+        # la selección (batch edit); si no, solo sobre el clickeado.
+        targets = selected if (clicked in selected and len(selected) > 1) else [clicked]
+        multi = len(targets) > 1
+
         menu = QMenu(self)
-        if ann.source != "human":
-            menu.addAction("✓ Aceptar sugerencia", lambda: self._accept_ann(ann))
-            menu.addAction("✗ Rechazar sugerencia", lambda: self._delete_ann(ann))
+        prov = [a for a in targets if a.source != "human"]
+        if prov:
+            menu.addAction(
+                f"✓ Aceptar sugerencias ({len(prov)})" if multi else "✓ Aceptar sugerencia",
+                lambda: self._accept_anns(prov))
+            menu.addAction(
+                f"✗ Rechazar sugerencias ({len(prov)})" if multi else "✗ Rechazar sugerencia",
+                lambda: self._delete_anns(prov))
             menu.addSeparator()
-        change_menu = menu.addMenu("Cambiar clase")
+
+        change_title = (f"Cambiar clase de {len(targets)} seleccionadas"
+                        if multi else "Cambiar clase")
+        change_menu = menu.addMenu(change_title)
         for class_id, (name, color) in self._classes.items():
             action = change_menu.addAction(name)
             action.setData((class_id, name, color))
-            if ann.class_id == class_id:
+            if not multi and clicked.class_id == class_id:
                 font = action.font()
                 font.setBold(True)
                 action.setFont(font)
         change_menu.triggered.connect(
-            lambda act, a=ann: self._apply_class_change(a, act.data())
+            lambda act, ts=targets: self._apply_class_change_many(ts, act.data())
         )
         menu.addSeparator()
-        menu.addAction("Borrar", lambda: self._delete_ann(ann))
+        menu.addAction(
+            f"Borrar {len(targets)} seleccionadas" if multi else "Borrar",
+            lambda: self._delete_anns(targets))
         menu.exec(self._ann_list.mapToGlobal(pos))
+
+    def _accept_anns(self, anns: list):
+        """Aceptar (provisional → human) un conjunto de anotaciones, con un solo undo."""
+        prov = [a for a in anns if a.source != "human"]
+        if not prov:
+            return
+        self._push_undo()
+        for ann in prov:
+            ann.source = "human"
+            ann.confidence = 1.0
+            box = self._box_for_ann(ann)
+            if box:
+                box.set_human()
+        self._refresh_ann_list()
+        if self._autosave_cb.isChecked():
+            self.save_annotations()
+        self._status_label.setText(f"{len(prov)} sugerencia(s) aceptada(s)")
+
+    def _delete_anns(self, anns: list):
+        """Borrar un conjunto de anotaciones con un solo undo."""
+        if not anns:
+            return
+        self._push_undo()
+        for ann in list(anns):
+            self._delete_ann(ann, push_undo=False)
+        if self._autosave_cb.isChecked():
+            self.save_annotations()
+        self._status_label.setText(f"{len(anns)} etiqueta(s) borrada(s)")
+
+    def _apply_class_change_many(self, anns: list, class_data: tuple):
+        """Cambiar la clase de varias anotaciones a la vez, con un solo undo."""
+        if not class_data or not anns:
+            return
+        class_id, name, color = class_data
+        changed = [a for a in anns if a.class_id != class_id]
+        if not changed:
+            return
+        self._push_undo()
+        for ann in changed:
+            ann.class_id = class_id
+            ann.class_name = name
+            for box in self._scene._boxes:
+                if box.annotation is ann:
+                    box.update_class(name, QColor(color))
+                    break
+        self._refresh_ann_list()
+        if self._autosave_cb.isChecked():
+            self.save_annotations()
+        self._status_label.setText(f"{len(changed)} etiqueta(s) → {name}")
 
     def _accept_ann(self, ann: Annotation):
         if ann.source == "human":
@@ -1115,14 +1185,12 @@ class AnnotationEditor(QWidget):
     # ── Delete ──
 
     def _delete_selected_annotation(self):
-        item = self._ann_list.currentItem()
-        if not item:
+        sel = self._selected_annotations()
+        if sel:
+            self._delete_anns(sel)   # batch (o una sola), con un solo undo
+        else:
             # fall back to whatever is selected in the scene
             self._scene.delete_selected_boxes()
-            return
-        ann = item.data(Qt.UserRole)
-        if ann:
-            self._delete_ann(ann)
 
     def _delete_ann(self, ann: Annotation, push_undo: bool = False):
         if push_undo:
