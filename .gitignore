@@ -59,6 +59,9 @@ Thumbs.db
 *.manifest
 build_log.txt
 
+# Logs
+*.log
+
 # IDE
 .vscode/
 .idea/

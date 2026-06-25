@@ -306,6 +306,21 @@ class Database:
             """, (image_id,))
             return cur.fetchall()
 
+    def get_annotations_full(self) -> list:
+        """Cajas con clase + imagen, para análisis geométrico.
+        Filas: (ann_id, image_id, class_id, class_name, class_color,
+                x, y, w, h, path, filename, status)."""
+        with self.cursor() as cur:
+            cur.execute("""
+                SELECT a.id, a.image_id, a.class_id, c.name, c.color,
+                       a.x, a.y, a.width, a.height,
+                       i.path, i.filename, i.status
+                FROM annotations a
+                JOIN classes c ON c.id = a.class_id
+                JOIN images i ON i.id = a.image_id
+            """)
+            return cur.fetchall()
+
     def get_annotations_with_image_paths(self) -> list:
         with self.cursor() as cur:
             cur.execute("""

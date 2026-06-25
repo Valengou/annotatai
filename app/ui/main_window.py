@@ -13,6 +13,7 @@ from .image_grid import ImageGrid
 from .graph_view import GraphView
 from .annotation_editor import AnnotationEditor
 from .bbox_view import BBoxOutlierView
+from .geometry_outliers_dialog import GeometryOutliersDialog
 from .analysis_lab import AnalysisLabDialog
 from .dialogs import (
     NewProjectDialog, ClassManagerDialog, ExportDialog, LoadAnnotationsDialog,
@@ -733,9 +734,13 @@ class MainWindow(QMainWindow):
         self._act_bbox_embed.triggered.connect(self.generate_bbox_embeddings)
         tools_menu.addAction(self._act_bbox_embed)
 
-        self._act_bbox_umap = QAction("Analizar Bboxes Raras (UMAP)...", self)
+        self._act_bbox_umap = QAction("Analizar Bboxes Raras (UMAP visual)...", self)
         self._act_bbox_umap.triggered.connect(self.run_bbox_umap)
         tools_menu.addAction(self._act_bbox_umap)
+
+        self._act_bbox_geom = QAction("Bboxes raras por geometría (por clase)...", self)
+        self._act_bbox_geom.triggered.connect(self.open_geometry_outliers)
+        tools_menu.addAction(self._act_bbox_geom)
 
         tools_menu.addSeparator()
         self._act_classes = QAction("Administrar Clases...", self)
@@ -764,7 +769,7 @@ class MainWindow(QMainWindow):
                     self._act_autolabel_hub, self._act_near_dups,
                     self._act_active_learning, self._act_search_index,
                     self._act_concept_discovery,
-                    self._act_bbox_embed, self._act_bbox_umap,
+                    self._act_bbox_embed, self._act_bbox_umap, self._act_bbox_geom,
                     self._act_export, self._act_classes]:
             act.setEnabled(active)
 
@@ -823,6 +828,7 @@ class MainWindow(QMainWindow):
         classes = self._project.db.get_all_classes()
         self._image_grid.set_classes(classes)
         self._graph_view.set_classes(classes)
+        self._bbox_view.set_classes(classes)
         self._load_all_images()
         self._status_label.setText(f"Proyecto: {self._project.name}")
 
@@ -1874,6 +1880,22 @@ class MainWindow(QMainWindow):
             self._lasso_nav_idx = self._lasso_nav_ids.index(image_id)
         self._open_annotation_editor(image_id)
         self._tabs.setCurrentIndex(2)
+
+    def open_geometry_outliers(self):
+        if not self._project:
+            return
+        with self._project.db.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM annotations")
+            if cur.fetchone()[0] == 0:
+                QMessageBox.information(
+                    self, "Bboxes raras por geometría",
+                    "No hay anotaciones todavía.")
+                return
+        classes = self._project.db.get_all_classes()
+        dlg = GeometryOutliersDialog(self._project.db, classes, self)
+        dlg.open_image_requested.connect(self._on_bbox_open_image)
+        self._geometry_dialog = dlg   # mantener referencia (modeless)
+        dlg.show()
 
     def _on_lasso_selection_changed(self, image_ids: list):
         self._lasso_nav_ids = image_ids

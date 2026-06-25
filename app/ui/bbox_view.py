@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QFrame, QCheckBox, QSizePolicy,
+    QScrollArea, QFrame, QCheckBox, QSizePolicy, QComboBox,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QImage, QColor
@@ -148,6 +148,8 @@ class BBoxOutlierView(QWidget):
         self._scores   = np.array([])
         self._statuses: list[str] = []
         self._status_filter: str = "todas"
+        self._classes_per_point: list[str] = []
+        self._class_filter: str | None = None
         self._discarded_ann_ids: set[int] = set()
 
         self._scatter       = None
@@ -194,6 +196,14 @@ class BBoxOutlierView(QWidget):
         clear_sel_btn.setFixedWidth(130)
         clear_sel_btn.clicked.connect(self._clear_lasso_selection)
         top.addWidget(clear_sel_btn)
+
+        cls_lbl = QLabel("Clase:")
+        cls_lbl.setStyleSheet("color:#999; font-size:11px; margin-left:10px;")
+        top.addWidget(cls_lbl)
+        self._class_combo = QComboBox()
+        self._class_combo.addItem("Todas", None)
+        self._class_combo.currentIndexChanged.connect(self._on_class_filter_changed)
+        top.addWidget(self._class_combo)
 
         top.addStretch()
         self._info_lbl = QLabel("Sin datos — generá embeddings de bboxes primero")
@@ -292,15 +302,52 @@ class BBoxOutlierView(QWidget):
         self._ys            = np.array([r[2] for r in proj_rows])
         self._scores        = np.array([r[3] for r in proj_rows])
         self._statuses      = [r[11] for r in proj_rows]   # image status
+        self._classes_per_point = [r[12] for r in proj_rows]  # class name
         self._selected_mask = np.zeros(len(proj_rows), dtype=bool)
         self._discarded_ann_ids.clear()
         self._redraw_scatter()
-        self._populate_strip(np.argsort(self._scores)[::-1][:50])
+        self._populate_strip(self._top_visible_indices(50))
 
     def apply_status_filter(self, status: str):
         self._status_filter = status
         if self._proj_rows and HAS_MPL:
             self._redraw_scatter()
+            self._populate_strip(self._top_visible_indices(50))
+
+    def set_classes(self, classes: list):
+        """Llena el combo de clases (id, name, color)."""
+        if not HAS_MPL:
+            return
+        self._class_combo.blockSignals(True)
+        self._class_combo.clear()
+        self._class_combo.addItem("Todas", None)
+        for _cid, name, _color in classes:
+            self._class_combo.addItem(name, name)
+        self._class_combo.blockSignals(False)
+        self._class_filter = None
+
+    def _on_class_filter_changed(self):
+        self._class_filter = self._class_combo.currentData()
+        if self._proj_rows and HAS_MPL:
+            self._redraw_scatter()
+            self._populate_strip(self._top_visible_indices(50))
+
+    def _visible_mask(self) -> np.ndarray:
+        n = len(self._xs)
+        if n == 0:
+            return np.array([], dtype=bool)
+        discarded = np.isin(self._ann_ids, list(self._discarded_ann_ids))
+        status_ok = (np.ones(n, dtype=bool)
+                     if self._status_filter == "todas" or not self._statuses
+                     else np.array([s == self._status_filter for s in self._statuses]))
+        class_ok = (np.ones(n, dtype=bool)
+                    if self._class_filter is None or not self._classes_per_point
+                    else np.array([c == self._class_filter for c in self._classes_per_point]))
+        return status_ok & class_ok & ~discarded
+
+    def _top_visible_indices(self, n: int) -> np.ndarray:
+        vis = np.where(self._visible_mask())[0]
+        return vis[np.argsort(self._scores[vis])[::-1]][:n]
 
     def set_db(self, db):
         self._db = db
@@ -317,17 +364,10 @@ class BBoxOutlierView(QWidget):
             self._canvas.draw()
             return
 
-        discarded    = np.isin(self._ann_ids, list(self._discarded_ann_ids))
-        status_match = (
-            np.ones(len(self._xs), dtype=bool)
-            if self._status_filter == "todas" or not self._statuses
-            else np.array([s == self._status_filter for s in self._statuses])
-        )
-
         colors_rgba = cm.RdYlGn_r(Normalize(0, 1)(self._scores))
 
-        # visible = matches filter AND not discarded
-        visible = status_match & ~discarded
+        # visible = matches status + class filters AND not discarded
+        visible = self._visible_mask()
         dim     = ~visible
 
         # Draw dim background first
@@ -393,10 +433,8 @@ class BBoxOutlierView(QWidget):
         points = np.column_stack([self._xs, self._ys])
         in_lasso = path.contains_points(points)
 
-        # Restrict to currently visible (status filter)
-        if self._status_filter != "todas" and self._statuses:
-            status_ok = np.array([s == self._status_filter for s in self._statuses])
-            in_lasso = in_lasso & status_ok
+        # Restrict to currently visible (status + class filters)
+        in_lasso = in_lasso & self._visible_mask()
 
         self._selected_mask = in_lasso
         n = int(self._selected_mask.sum())
@@ -426,7 +464,7 @@ class BBoxOutlierView(QWidget):
     def _clear_lasso_selection(self):
         self._selected_mask = np.zeros(len(self._xs), dtype=bool)
         self._redraw_scatter()
-        self._populate_strip(np.argsort(self._scores)[::-1][:50])
+        self._populate_strip(self._top_visible_indices(50))
         self._strip_lbl.setText("Tira de crops (top-50 por score):")
         self.lasso_selection_changed.emit([])   # clear nav override
 
