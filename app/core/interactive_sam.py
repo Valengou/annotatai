@@ -51,13 +51,18 @@ class InteractiveSAM:
         self._predictor.set_image(path)
 
     def predict_point(self, px: float, py: float) -> dict | None:
-        """Predice a partir de un punto (en píxeles de la imagen).
+        """Atajo: un solo punto positivo."""
+        return self.predict_points([(px, py)], [1])
 
-        Devuelve {'box': (x, y, w, h) normalizado, 'polygon': [(x,y),...]|None}
+    def predict_points(self, points: list, labels: list) -> dict | None:
+        """Predice a partir de varios puntos (en píxeles) con labels 1=positivo,
+        0=negativo. Devuelve {'box': (x,y,w,h) normalizado, 'polygon': [...]|None}
         o None si no hay máscara."""
-        if self._predictor is None or self._image_path is None:
+        if self._predictor is None or self._image_path is None or not points:
             return None
-        results = self._predictor(points=[[float(px), float(py)]], labels=[1])
+        pts = [[float(p[0]), float(p[1])] for p in points]
+        lbls = [int(l) for l in labels]
+        results = self._predictor(points=pts, labels=lbls)
         if not results:
             return None
         r = results[0]

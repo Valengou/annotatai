@@ -265,7 +265,7 @@ class AnnotationScene(QGraphicsScene):
     box_updated = Signal(object)          # Annotation
     box_deleted = Signal(object)          # Annotation
     class_change_requested = Signal(object)  # BoundingBoxItem
-    sam_point_clicked = Signal(float, float)  # punto (px, py) en coords de imagen
+    sam_point_clicked = Signal(float, float, bool)  # (px, py, positivo) en coords de imagen
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -324,10 +324,12 @@ class AnnotationScene(QGraphicsScene):
     # ── Mouse events ──
 
     def mousePressEvent(self, event):
-        if self._sam_mode and event.button() == Qt.LeftButton:
+        if self._sam_mode and event.button() in (Qt.LeftButton, Qt.RightButton):
             pos = event.scenePos()
             if self.sceneRect().contains(pos):
-                self.sam_point_clicked.emit(pos.x(), pos.y())
+                # izquierdo = punto positivo (incluir), derecho = negativo (excluir)
+                self.sam_point_clicked.emit(
+                    pos.x(), pos.y(), event.button() == Qt.LeftButton)
                 event.accept()
                 return
         if self._draw_mode and event.button() == Qt.LeftButton:
@@ -508,9 +510,10 @@ class _SamWorker(QObject):
         except Exception as e:
             self.failed.emit(str(e))
 
-    def predict(self, px: float, py: float):
+    def predict(self, payload):
         try:
-            self.box_ready.emit(self._sam.predict_point(px, py))
+            points, labels = payload
+            self.box_ready.emit(self._sam.predict_points(points, labels))
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -525,7 +528,7 @@ class AnnotationEditor(QWidget):
     # Solicitudes al worker SAM (cruzan al hilo del worker)
     _sam_load_requested    = Signal()
     _sam_image_requested   = Signal(str)
-    _sam_predict_requested = Signal(float, float)
+    _sam_predict_requested = Signal(object)   # (points, labels)
 
     _PIXMAP_CACHE_SIZE = 8
     _MAX_UNDO = 30
@@ -550,6 +553,12 @@ class AnnotationEditor(QWidget):
         self._sam_image_path: str | None = None   # imagen ya codificada en SAM
         self._sam_pending_image: str | None = None
         self._sam_busy = False
+        # Objeto activo en construcción (multi-punto)
+        self._sam_points: list[tuple[float, float]] = []
+        self._sam_labels: list[int] = []          # 1=positivo, 0=negativo
+        self._sam_preview: dict | None = None      # {box, polygon} sin confirmar
+        self._sam_overlay_items: list = []         # items temporales en la escena
+        self._sam_pending_predict = False
 
         # Create scene and view first — _build_toolbar references self._view
         self._scene = AnnotationScene()
@@ -613,6 +622,7 @@ class AnnotationEditor(QWidget):
             "← / → navegar imágenes\n"
             "R → revisada   X → descartar\n"
             "D → modo dibujo   S → SAM click   A → aceptar sugerencias\n"
+            "SAM: clic izq=punto +   clic der=punto −   Enter=confirmar   Esc=cancelar\n"
             "F → ajustar vista\n"
             "Del → borrar bbox seleccionado\n"
             "Ctrl+S → guardar manual\n"
@@ -706,7 +716,8 @@ class AnnotationEditor(QWidget):
 
         self._sam_btn = QPushButton("🪄 SAM click [S]")
         self._sam_btn.setCheckable(True)
-        self._sam_btn.setToolTip("Click sobre un objeto y SAM2 propone la caja ajustada")
+        self._sam_btn.setToolTip(
+            "SAM2 interactivo: clic izq=punto +, clic der=punto −, Enter=confirmar, Esc=cancelar")
         self._sam_btn.toggled.connect(self._toggle_sam_mode)
         row.addWidget(self._sam_btn)
 
@@ -902,8 +913,9 @@ class AnnotationEditor(QWidget):
         self._view.fit_in_view()
         # Garantizar que el canvas tenga el foco para que ← → R X funcionen
         self._view.setFocus(Qt.OtherFocusReason)
-        # Si el modo SAM está activo, re-codificar la nueva imagen
+        # Si el modo SAM está activo, descartar objeto activo y re-codificar
         if self._sam_btn.isChecked():
+            self._sam_reset()
             self._sam_request_current_image()
 
     # ── Box events ──
@@ -1236,7 +1248,7 @@ class AnnotationEditor(QWidget):
 
     def _update_mode_label(self):
         if self._sam_btn.isChecked():
-            self._mode_label.setText("🪄  MODO SAM — click sobre un objeto para crear bbox")
+            self._mode_label.setText("🪄  MODO SAM — izq=+  der=−  Enter=confirmar  Esc=cancelar")
             self._mode_label.setStyleSheet(
                 "background:#5a2a8a; color:#fff; font-weight:bold;"
                 " border-radius:3px; padding:3px 8px;")
@@ -1266,6 +1278,8 @@ class AnnotationEditor(QWidget):
                 self._sam_request_current_image()
             else:
                 self._status_label.setText("SAM: cargando modelo (primera vez descarga)...")
+        else:
+            self._sam_reset()
         self._update_mode_label()
 
     def _ensure_sam_thread(self):
@@ -1306,7 +1320,7 @@ class AnnotationEditor(QWidget):
         self._sam_busy = False
         self._status_label.setText("SAM: clickeá un objeto")
 
-    def _on_sam_point(self, px: float, py: float):
+    def _on_sam_point(self, px: float, py: float, positive: bool):
         if not self._sam_btn.isChecked():
             return
         if not self._sam_loaded:
@@ -1315,23 +1329,99 @@ class AnnotationEditor(QWidget):
         if self._image is not None and self._sam_image_path != self._image.path:
             self._sam_request_current_image()
             return
+        # Acumular el punto en el objeto activo y re-predecir
+        self._sam_points.append((px, py))
+        self._sam_labels.append(1 if positive else 0)
+        self._redraw_sam_overlay()
+        self._request_sam_predict()
+
+    def _request_sam_predict(self):
+        if not self._sam_points:
+            return
+        if 1 not in self._sam_labels:
+            self._status_label.setText(
+                "SAM: agregá un punto positivo (clic izquierdo) primero")
+            return
         if self._sam_busy:
+            self._sam_pending_predict = True
             return
         self._sam_busy = True
-        self._status_label.setText("SAM: segmentando...")
-        self._sam_predict_requested.emit(px, py)
+        self._sam_pending_predict = False
+        n_pos = sum(self._sam_labels)
+        n_neg = len(self._sam_labels) - n_pos
+        self._status_label.setText(
+            f"SAM: segmentando ({n_pos}+/{n_neg}-)…  Enter=confirmar  Esc=cancelar")
+        self._sam_predict_requested.emit(
+            (list(self._sam_points), list(self._sam_labels)))
 
     def _on_sam_box_ready(self, res):
         self._sam_busy = False
-        if not res:
-            self._status_label.setText("SAM: no se encontró objeto en ese punto")
-            return
-        self._add_sam_box(res["box"], res.get("polygon"))
-        self._status_label.setText("SAM: caja creada ✓")
+        if res:
+            self._sam_preview = res
+            self._status_label.setText(
+                "SAM: Enter=confirmar · clic izq=+  der=−  · Esc=cancelar")
+        else:
+            self._sam_preview = None
+            self._status_label.setText("SAM: sin máscara para esos puntos")
+        self._redraw_sam_overlay()
+        if self._sam_pending_predict:
+            self._request_sam_predict()
 
     def _on_sam_failed(self, msg: str):
         self._sam_busy = False
         self._status_label.setText(f"SAM error: {msg[:80]}")
+
+    # ── Overlay temporal del objeto activo ──
+
+    def _clear_sam_overlay(self):
+        for it in self._sam_overlay_items:
+            try:
+                self._scene.removeItem(it)
+            except Exception:
+                pass
+        self._sam_overlay_items = []
+
+    def _redraw_sam_overlay(self):
+        self._clear_sam_overlay()
+        if self._image is None:
+            return
+        W = self._scene.sceneRect().width()
+        H = self._scene.sceneRect().height()
+        # Caja preview (punteada)
+        if self._sam_preview and self._sam_preview.get("box"):
+            x, y, w, h = self._sam_preview["box"]
+            pen = QPen(QColor("#00e5ff"), 2, Qt.DashLine)
+            pen.setCosmetic(True)
+            fill = QColor(0, 229, 255, 40)
+            rect_item = self._scene.addRect(x * W, y * H, w * W, h * H,
+                                            pen, QBrush(fill))
+            rect_item.setZValue(40)
+            self._sam_overlay_items.append(rect_item)
+        # Marcadores de puntos (verde=+, rojo=−)
+        r = max(4.0, min(W, H) * 0.006)
+        for (px, py), lab in zip(self._sam_points, self._sam_labels):
+            col = QColor("#2ecc71") if lab == 1 else QColor("#e74c3c")
+            dot = self._scene.addEllipse(px - r, py - r, 2 * r, 2 * r,
+                                         QPen(QColor("#000"), 1), QBrush(col))
+            dot.setZValue(41)
+            self._sam_overlay_items.append(dot)
+
+    def _sam_reset(self):
+        self._sam_points = []
+        self._sam_labels = []
+        self._sam_preview = None
+        self._sam_pending_predict = False
+        self._clear_sam_overlay()
+
+    def _sam_commit(self):
+        if not self._sam_preview or not self._sam_preview.get("box"):
+            self._sam_reset()
+            return
+        box = self._sam_preview["box"]
+        polygon = self._sam_preview.get("polygon")
+        self._sam_reset()
+        self._add_sam_box(box, polygon)
+        self._status_label.setText("SAM: caja confirmada ✓ — clickeá otro objeto")
 
     def _add_sam_box(self, box, polygon):
         if self._image is None:
@@ -1373,6 +1463,13 @@ class AnnotationEditor(QWidget):
     def eventFilter(self, obj, event):
         """Intercept navigation/status keys from the graphics view."""
         if obj is self._view and event.type() == QEvent.KeyPress:
+            if self._sam_btn.isChecked() and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+                self._sam_commit()
+                return True
+            if self._sam_btn.isChecked() and event.key() == Qt.Key_Escape:
+                self._sam_reset()
+                self._status_label.setText("SAM: objeto cancelado")
+                return True
             if event.key() == Qt.Key_Left:
                 self.navigate_request.emit(-1)
                 return True
@@ -1403,7 +1500,12 @@ class AnnotationEditor(QWidget):
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Left:
+        if self._sam_btn.isChecked() and event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self._sam_commit()
+        elif self._sam_btn.isChecked() and event.key() == Qt.Key_Escape:
+            self._sam_reset()
+            self._status_label.setText("SAM: objeto cancelado")
+        elif event.key() == Qt.Key_Left:
             self.navigate_request.emit(-1)
         elif event.key() == Qt.Key_Right:
             self.navigate_request.emit(1)
