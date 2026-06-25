@@ -153,6 +153,29 @@ class YoloeLabeler:
             yield path, AutoLabeler._extract_boxes([r])
 
 
+MAX_REFS = 8   # imágenes de referencia máximas para el ensemble de prompt visual
+
+
+def _iou_xywh(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a[0], a[1], a[0] + a[2], a[1] + a[3]
+    bx1, by1, bx2, by2 = b[0], b[1], b[0] + b[2], b[1] + b[3]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _nms(boxes: list, iou_thresh: float = 0.5) -> list:
+    """NMS simple sobre [(x, y, w, h, conf), ...] (normalizado, esquina sup-izq)."""
+    keep: list = []
+    for b in sorted(boxes, key=lambda d: d[4], reverse=True):
+        if all(_iou_xywh(b, k) < iou_thresh for k in keep):
+            keep.append(b)
+    return keep
+
+
 def run_auto_label_visual(db, class_id: int, class_name: str, target_rows: list,
                           conf: float, source: str,
                           model_name: str = DEFAULT_YOLOE_MODEL,
@@ -172,7 +195,8 @@ def run_auto_label_visual(db, class_id: int, class_name: str, target_rows: list,
     if not box_rows:
         return {"images": 0, "boxes": 0, "error": "sin_exemplar"}
 
-    # Imagen de referencia = la que más cajas humanas tiene de la clase
+    # Imágenes de referencia: hasta MAX_REFS, las que más cajas humanas tienen.
+    # Se usan TODAS como ejemplos (ensemble), no solo una → más robusto.
     by_image: dict[int, list] = {}
     ref_dims: dict[int, tuple] = {}
     ref_path_by_image: dict[int, str] = {}
@@ -181,18 +205,19 @@ def run_auto_label_visual(db, class_id: int, class_name: str, target_rows: list,
         ref_dims[image_id] = (iw, ih)
         ref_path_by_image[image_id] = path
 
-    ref_id = max(by_image, key=lambda k: len(by_image[k]))
-    ref_path = ref_path_by_image[ref_id]
-    iw, ih = ref_dims[ref_id]
-    exemplar_xyxy = [
-        [x * iw, y * ih, (x + w) * iw, (y + h) * ih]
-        for x, y, w, h in by_image[ref_id]
-    ]
+    ref_ids = sorted(by_image, key=lambda k: len(by_image[k]), reverse=True)[:MAX_REFS]
+    references = []   # [(ref_id, ref_path, exemplar_xyxy), ...]
+    for rid in ref_ids:
+        iw, ih = ref_dims[rid]
+        xyxy = [[x * iw, y * ih, (x + w) * iw, (y + h) * ih]
+                for x, y, w, h in by_image[rid]]
+        references.append((rid, ref_path_by_image[rid], xyxy))
 
+    ref_id_set = {r[0] for r in references}
     id_by_path = {row[1]: row[0] for row in target_rows}
     target_paths = [row[1] for row in target_rows
-                    if Path(row[1]).exists() and row[0] != ref_id]
-    if not target_paths:
+                    if Path(row[1]).exists() and row[0] not in ref_id_set]
+    if not target_paths or not references:
         return {"images": 0, "boxes": 0}
 
     labeler = YoloeLabeler(model_name=model_name, device=device, conf=conf)
@@ -202,12 +227,20 @@ def run_auto_label_visual(db, class_id: int, class_name: str, target_rows: list,
     n_images = 0
     n_boxes = 0
     done = 0
-    # Procesa en chunks y libera la cache de VRAM entre cada uno: en GPUs chicas
-    # (8 GB) evita que el pico crezca y que Windows derrame a memoria compartida.
+    # Procesa en chunks y libera la cache de VRAM entre cada uno (GPUs de 8 GB).
     for start in range(0, total, max(1, chunk_size)):
         chunk = target_paths[start:start + chunk_size]
-        for path, boxes in labeler.detect(chunk, ref_path, exemplar_xyxy,
-                                          class_name, imgsz=imgsz):
+        merged: dict[str, list] = {p: [] for p in chunk}
+        # Ensemble: cada imagen de referencia aporta sus detecciones
+        for _rid, ref_path, xyxy in references:
+            for path, boxes in labeler.detect(chunk, ref_path, xyxy,
+                                              class_name, imgsz=imgsz):
+                if boxes:
+                    merged.setdefault(path, []).extend(boxes)
+            _empty_cuda_cache()
+        # Fusiona las detecciones de todas las referencias con NMS
+        for path in chunk:
+            boxes = _nms(merged.get(path, []), iou_thresh=0.5)
             img_id = id_by_path.get(path)
             if img_id is not None and boxes:
                 for x, y, w, h, c in boxes:
@@ -218,9 +251,9 @@ def run_auto_label_visual(db, class_id: int, class_name: str, target_rows: list,
             done += 1
             if progress_callback:
                 progress_callback(done, total)
-        _empty_cuda_cache()
 
-    return {"images": n_images, "boxes": n_boxes, "reference": Path(ref_path).name}
+    return {"images": n_images, "boxes": n_boxes,
+            "references": len(references)}
 
 
 def _empty_cuda_cache():

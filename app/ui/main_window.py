@@ -41,6 +41,7 @@ from ..core.semantic_search import (
     generate_search_embeddings, SemanticSearchEngine, SEARCH_MODEL,
 )
 from ..core.concept_discovery import run_concept_discovery, parse_concepts
+from ..core.box_cleanup import cleanup_overlapping
 from ..models.image_item import ImageItem
 from ..utils.config import CLUSTER_COLORS
 
@@ -742,6 +743,10 @@ class MainWindow(QMainWindow):
         self._act_bbox_geom.triggered.connect(self.open_geometry_outliers)
         tools_menu.addAction(self._act_bbox_geom)
 
+        self._act_cleanup_iou = QAction("Limpiar detecciones solapadas (NMS por clase)...", self)
+        self._act_cleanup_iou.triggered.connect(self.run_cleanup_overlaps)
+        tools_menu.addAction(self._act_cleanup_iou)
+
         tools_menu.addSeparator()
         self._act_classes = QAction("Administrar Clases...", self)
         self._act_classes.triggered.connect(self.manage_classes)
@@ -770,6 +775,7 @@ class MainWindow(QMainWindow):
                     self._act_active_learning, self._act_search_index,
                     self._act_concept_discovery,
                     self._act_bbox_embed, self._act_bbox_umap, self._act_bbox_geom,
+                    self._act_cleanup_iou,
                     self._act_export, self._act_classes]:
             act.setEnabled(active)
 
@@ -833,6 +839,9 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f"Proyecto: {self._project.name}")
 
     def _load_all_images(self):
+        # Mantener detection_min/avg_confidence al día con las detecciones reales
+        # para que el filtro de confianza de la galería funcione.
+        self._project.db.recompute_detection_confidence()
         rows = self._project.db.get_all_images()
         self._current_images = [ImageItem.from_db_row(r) for r in rows]
         self._image_by_id = {img.id: img for img in self._current_images}
@@ -1617,9 +1626,11 @@ class MainWindow(QMainWindow):
         )
         new_cls = result.get("classes", [])
         oom = result.get("oom_skipped", 0)
+        refs = result.get("references")
         msg = (
             f"Cajas generadas: {n_boxes}\n"
             f"Imágenes con detecciones: {n_images}\n"
+            + (f"Imágenes de ejemplo usadas (YOLOE): {refs}\n" if refs else "")
             + (f"Clases nuevas: {', '.join(new_cls)}\n" if new_cls else "")
         )
         if oom:
@@ -1896,6 +1907,26 @@ class MainWindow(QMainWindow):
         dlg.open_image_requested.connect(self._on_bbox_open_image)
         self._geometry_dialog = dlg   # mantener referencia (modeless)
         dlg.show()
+
+    def run_cleanup_overlaps(self):
+        if not self._project:
+            return
+        iou, ok = QInputDialog.getDouble(
+            self, "Limpiar detecciones solapadas",
+            "Umbral IoU — cajas de la MISMA clase que se solapan más que esto\n"
+            "colapsan a la de mayor confianza. Las cajas humanas nunca se borran.",
+            0.50, 0.10, 0.95, 2)
+        if not ok:
+            return
+        result = cleanup_overlapping(self._project.db, iou_thresh=float(iou))
+        self._load_all_images()
+        n = result.get("removed", 0)
+        imgs = result.get("images", 0)
+        self._status_label.setText(
+            f"Limpieza IoU: {n} cajas solapadas eliminadas en {imgs} imágenes")
+        QMessageBox.information(
+            self, "Limpiar detecciones solapadas",
+            f"Cajas solapadas eliminadas: {n}\nImágenes afectadas: {imgs}")
 
     def _on_lasso_selection_changed(self, image_ids: list):
         self._lasso_nav_ids = image_ids

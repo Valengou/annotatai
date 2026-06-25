@@ -571,6 +571,23 @@ class Database:
         with self.cursor() as cur:
             cur.execute("DELETE FROM annotations WHERE id=?", (ann_id,))
 
+    def delete_annotations(self, ann_ids: list) -> int:
+        if not ann_ids:
+            return 0
+        with self.cursor() as cur:
+            placeholders = ",".join("?" * len(ann_ids))
+            cur.execute(f"DELETE FROM annotations WHERE id IN ({placeholders})", ann_ids)
+            return cur.rowcount
+
+    def get_annotations_for_cleanup(self) -> list:
+        """(ann_id, image_id, class_id, x, y, w, h, source, confidence) — para NMS."""
+        with self.cursor() as cur:
+            cur.execute(
+                "SELECT id, image_id, class_id, x, y, width, height, source, confidence "
+                "FROM annotations"
+            )
+            return cur.fetchall()
+
     def get_annotations_for_image(self, image_id: int) -> list:
         with self.cursor() as cur:
             cur.execute(
@@ -602,6 +619,22 @@ class Database:
                 (status,),
             )
             return cur.fetchall()
+
+    def recompute_detection_confidence(self):
+        """Recalcula detection_min/avg_confidence por imagen a partir de la
+        confianza de sus detecciones (source != 'human'). Imágenes sin
+        detecciones del modelo quedan en NULL. Conecta el filtro de confianza
+        de la galería con las cajas reales."""
+        with self.cursor() as cur:
+            cur.execute("""
+                UPDATE images SET
+                    detection_min_confidence = (
+                        SELECT MIN(a.confidence) FROM annotations a
+                        WHERE a.image_id = images.id AND a.source != 'human'),
+                    detection_avg_confidence = (
+                        SELECT AVG(a.confidence) FROM annotations a
+                        WHERE a.image_id = images.id AND a.source != 'human')
+            """)
 
     def count_human_boxes_in_reviewed_per_class(self) -> dict:
         """{class_id: n_cajas_humanas} contando solo imágenes revisadas (lo que se

@@ -365,6 +365,7 @@ class ImageGrid(QWidget):
         self._sort_mode = "filename"
         self._confidence_filter = "all"
         self._confidence_threshold = 0.50
+        self._confidence_dir = "le"       # le = <= umbral | ge = >= umbral
         self._annotation_filter = "all"   # all | with | without
         self._setup_ui()
 
@@ -426,12 +427,19 @@ class ImageGrid(QWidget):
         sort_layout.addWidget(conf_label)
         self._confidence_combo = QComboBox()
         self._confidence_combo.addItem("Todas", "all")
-        self._confidence_combo.addItem("Prioridad <= umbral", "priority")
-        self._confidence_combo.addItem("Det min <= umbral", "det_min")
-        self._confidence_combo.addItem("Det avg <= umbral", "det_avg")
-        self._confidence_combo.addItem("Clasif <= umbral", "cls")
+        self._confidence_combo.addItem("Prioridad", "priority")
+        self._confidence_combo.addItem("Det min", "det_min")
+        self._confidence_combo.addItem("Det avg", "det_avg")
+        self._confidence_combo.addItem("Clasif", "cls")
         self._confidence_combo.currentIndexChanged.connect(self._on_confidence_filter_changed)
         sort_layout.addWidget(self._confidence_combo)
+        self._confidence_dir_combo = QComboBox()
+        self._confidence_dir_combo.addItem("≤", "le")
+        self._confidence_dir_combo.addItem("≥", "ge")
+        self._confidence_dir_combo.setToolTip(
+            "≤ = ver baja confianza (revisar) · ≥ = ver alta confianza (validar rápido)")
+        self._confidence_dir_combo.currentIndexChanged.connect(self._on_confidence_dir_changed)
+        sort_layout.addWidget(self._confidence_dir_combo)
         self._confidence_spin = QDoubleSpinBox()
         self._confidence_spin.setRange(0.0, 1.0)
         self._confidence_spin.setSingleStep(0.05)
@@ -606,6 +614,10 @@ class ImageGrid(QWidget):
         self._confidence_filter = self._confidence_combo.currentData() or "all"
         self._apply_filters()
 
+    def _on_confidence_dir_changed(self):
+        self._confidence_dir = self._confidence_dir_combo.currentData() or "le"
+        self._apply_filters()
+
     def _on_annotation_filter_changed(self):
         self._annotation_filter = self._annotation_combo.currentData() or "all"
         self._apply_filters()
@@ -631,7 +643,10 @@ class ImageGrid(QWidget):
         if value is None:
             return False
         try:
-            return float(value) <= self._confidence_threshold
+            v = float(value)
+            if self._confidence_dir == "ge":
+                return v >= self._confidence_threshold
+            return v <= self._confidence_threshold
         except Exception:
             return False
 

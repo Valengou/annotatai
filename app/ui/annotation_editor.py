@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem,
     QGraphicsPolygonItem,
     QGraphicsItem, QListWidget, QListWidgetItem, QComboBox,
-    QSplitter, QMenu, QCheckBox, QAbstractItemView,
+    QSplitter, QMenu, QCheckBox, QAbstractItemView, QDoubleSpinBox,
 )
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSizeF, QEvent, QThread, QObject
 from PySide6.QtGui import (
@@ -653,6 +653,25 @@ class AnnotationEditor(QWidget):
         self._filter_list.itemChanged.connect(self._on_filter_item_changed)
         right_layout.addWidget(self._filter_list)
 
+        # ── Filtro dinámico de confianza ──
+        conf_row = QHBoxLayout()
+        conf_row.setContentsMargins(0, 0, 0, 0)
+        conf_lbl = QLabel("Ocultar conf <")
+        conf_lbl.setStyleSheet("color:#999; font-size:11px;")
+        conf_row.addWidget(conf_lbl)
+        self._conf_filter_spin = QDoubleSpinBox()
+        self._conf_filter_spin.setRange(0.0, 1.0)
+        self._conf_filter_spin.setSingleStep(0.05)
+        self._conf_filter_spin.setDecimals(2)
+        self._conf_filter_spin.setValue(0.0)
+        self._conf_filter_spin.setToolTip(
+            "Oculta las sugerencias con confianza menor al umbral.\n"
+            "Las cajas humanas siempre se muestran.")
+        self._conf_filter_spin.valueChanged.connect(self._refresh_ann_list)
+        conf_row.addWidget(self._conf_filter_spin)
+        conf_row.addStretch()
+        right_layout.addLayout(conf_row)
+
         right_layout.addWidget(QLabel("Anotaciones:"))
         self._ann_list = QListWidget()
         self._ann_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -800,11 +819,21 @@ class AnnotationEditor(QWidget):
                 return it.checkState() == Qt.Checked
         return True
 
+    def _ann_passes_conf(self, ann) -> bool:
+        """True si la anotación supera el umbral de confianza del editor.
+        Las humanas siempre pasan."""
+        thr = self._conf_filter_spin.value()
+        if thr <= 0.0 or ann.source == "human":
+            return True
+        return (ann.confidence or 0.0) >= thr
+
     def _apply_visibility(self):
-        """Aplica el checkbox maestro + filtro de clases a las cajas del lienzo."""
+        """Aplica el checkbox maestro + filtro de clases + confianza al lienzo."""
         show = self._show_labels_cb.isChecked()
         for box in self._scene._boxes:
-            box.setVisible(show and self._class_visible(box.annotation.class_id))
+            ok = (show and self._class_visible(box.annotation.class_id)
+                  and self._ann_passes_conf(box.annotation))
+            box.setVisible(ok)
 
     def _on_filter_item_changed(self, _item):
         self._refresh_ann_list()   # refresca lista (respeta filtro) + visibilidad
@@ -945,6 +974,8 @@ class AnnotationEditor(QWidget):
         self._ann_list.clear()
         for ann in self._pending_annotations:
             if not self._class_visible(ann.class_id):
+                continue
+            if not self._ann_passes_conf(ann):
                 continue
             provisional = ann.source != "human"
             color = self._classes.get(ann.class_id, (ann.class_name, "#FF0000"))[1]
