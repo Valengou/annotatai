@@ -150,6 +150,7 @@ class BBoxOutlierView(QWidget):
         self._status_filter: str = "todas"
         self._classes_per_point: list[str] = []
         self._class_filter: str | None = None
+        self._all_classes: list = []      # (id, name, color) para ordenar el combo
         self._discarded_ann_ids: set[int] = set()
 
         self._scatter       = None
@@ -305,6 +306,7 @@ class BBoxOutlierView(QWidget):
         self._classes_per_point = [r[12] for r in proj_rows]  # class name
         self._selected_mask = np.zeros(len(proj_rows), dtype=bool)
         self._discarded_ann_ids.clear()
+        self._rebuild_class_combo()   # solo clases presentes en las cajas
         self._redraw_scatter()
         self._populate_strip(self._top_visible_indices(50))
 
@@ -315,16 +317,29 @@ class BBoxOutlierView(QWidget):
             self._populate_strip(self._top_visible_indices(50))
 
     def set_classes(self, classes: list):
-        """Llena el combo de clases (id, name, color)."""
+        """Recibe (id, name, color); el combo se llena solo con las presentes."""
         if not HAS_MPL:
             return
+        self._all_classes = classes
+        self._rebuild_class_combo()
+
+    def _rebuild_class_combo(self):
+        """Combo de clases con SOLO las presentes en las cajas proyectadas."""
+        if not HAS_MPL:
+            return
+        present = set(self._classes_per_point)
+        names = [name for _cid, name, _color in self._all_classes if name in present]
         self._class_combo.blockSignals(True)
         self._class_combo.clear()
         self._class_combo.addItem("Todas", None)
-        for _cid, name, _color in classes:
+        for name in names:
             self._class_combo.addItem(name, name)
+        # mantener selección si sigue presente, si no volver a Todas
+        if self._class_filter in names:
+            self._class_combo.setCurrentText(self._class_filter)
+        else:
+            self._class_filter = None
         self._class_combo.blockSignals(False)
-        self._class_filter = None
 
     def _on_class_filter_changed(self):
         self._class_filter = self._class_combo.currentData()

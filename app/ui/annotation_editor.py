@@ -19,6 +19,11 @@ from ..utils.config import DEFAULT_INTERACTIVE_SAM_MODEL
 
 H = 8   # handle size in pixels
 
+# Criticidad de una caja (severity)
+SEVERITY_ORDER  = ["nula", "leve", "moderada", "critica"]
+SEVERITY_LABELS = {"nula": "Nula", "leve": "Leve", "moderada": "Moderada", "critica": "Crítica"}
+SEVERITY_COLORS = {"nula": "#888888", "leve": "#f1c40f", "moderada": "#e67e22", "critica": "#e74c3c"}
+
 HANDLE_CURSORS = {
     "tl": Qt.SizeFDiagCursor, "t": Qt.SizeVerCursor,  "tr": Qt.SizeBDiagCursor,
     "r":  Qt.SizeHorCursor,   "br": Qt.SizeFDiagCursor, "b": Qt.SizeVerCursor,
@@ -151,9 +156,16 @@ class BoundingBoxItem(QGraphicsRectItem):
         # Fondo de la etiqueta con el color de la clase para que se lea siempre
         bg = QColor(self.box_color)
         bg.setAlpha(230)
+        sev = getattr(self.annotation, "severity", "nula")
+        sev_html = ""
+        if sev and sev != "nula":
+            sc = SEVERITY_COLORS.get(sev, "#888")
+            sev_html = (f'<span style="font-size:7px;background:{sc};color:#fff;'
+                        f'padding:0 2px;border-radius:2px;">'
+                        f'{SEVERITY_LABELS.get(sev, sev)}</span>')
         self._label.setHtml(
             f'<div style="background:{bg.name()};color:#fff;'
-            f'padding:0 3px;border-radius:2px;">{self._label_inner()}</div>'
+            f'padding:0 3px;border-radius:2px;">{self._label_inner()} {sev_html}</div>'
         )
         if self._polygon_item:
             poly_pen = QPen(self.box_color, 2, Qt.SolidLine)
@@ -629,7 +641,7 @@ class AnnotationEditor(QWidget):
             "Ctrl+Z → deshacer\n"
             "Ctrl+Y → rehacer\n"
             "Click → seleccionar bbox  (Ctrl/Shift → varias)\n"
-            "Clic derecho en la lista → cambiar clase / borrar en lote\n"
+            "Clic derecho en la lista → cambiar clase / criticidad / borrar (lote)\n"
             "Arrastrar vértice → redimensionar\n"
             "Rueda → zoom   Medio → pan"
         )
@@ -853,7 +865,7 @@ class AnnotationEditor(QWidget):
     def _snapshot(self) -> list:
         return [
             (a.class_id, a.class_name, a.x, a.y, a.width, a.height,
-             a.source, a.confidence, a.polygon)
+             a.source, a.confidence, a.polygon, getattr(a, "severity", "nula"))
             for a in self._pending_annotations
         ]
 
@@ -868,7 +880,8 @@ class AnnotationEditor(QWidget):
         self._pending_annotations = [
             Annotation(class_id=s[0], class_name=s[1], x=s[2], y=s[3],
                        width=s[4], height=s[5], source=s[6], confidence=s[7],
-                       polygon=s[8] if len(s) > 8 else None)
+                       polygon=s[8] if len(s) > 8 else None,
+                       severity=s[9] if len(s) > 9 else "nula")
             for s in snapshot
         ]
         if self._image:
@@ -983,12 +996,17 @@ class AnnotationEditor(QWidget):
                 label = f"⟳ {ann.class_name}  ·  {ann.confidence:.0%}"
             else:
                 label = f"✓ {ann.class_name}"
+            sev = getattr(ann, "severity", "nula")
+            if sev and sev != "nula":
+                label += f"  ·  {SEVERITY_LABELS.get(sev, sev)}"
             item = QListWidgetItem(label)
             # Punto de color de la clase para distinguir etiquetas de un vistazo
             pix = QPixmap(12, 12)
             pix.fill(QColor(color))
             item.setIcon(QIcon(pix))
-            if provisional:
+            if sev and sev != "nula":
+                item.setForeground(QColor(SEVERITY_COLORS.get(sev, "#ffcf66")))
+            elif provisional:
                 item.setForeground(QColor("#ffcf66"))   # ámbar = pendiente de validar
             item.setData(Qt.UserRole, ann)
             self._ann_list.addItem(item)
@@ -1095,11 +1113,45 @@ class AnnotationEditor(QWidget):
         change_menu.triggered.connect(
             lambda act, ts=targets: self._apply_class_change_many(ts, act.data())
         )
+
+        sev_title = (f"Criticidad de {len(targets)} seleccionadas"
+                     if multi else "Criticidad")
+        sev_menu = menu.addMenu(sev_title)
+        for key in SEVERITY_ORDER:
+            act = sev_menu.addAction(SEVERITY_LABELS[key])
+            act.setData(key)
+            if not multi and getattr(clicked, "severity", "nula") == key:
+                font = act.font()
+                font.setBold(True)
+                act.setFont(font)
+        sev_menu.triggered.connect(
+            lambda act, ts=targets: self._apply_severity_many(ts, act.data())
+        )
+
         menu.addSeparator()
         menu.addAction(
             f"Borrar {len(targets)} seleccionadas" if multi else "Borrar",
             lambda: self._delete_anns(targets))
         menu.exec(self._ann_list.mapToGlobal(pos))
+
+    def _apply_severity_many(self, anns: list, severity: str):
+        """Asigna criticidad a un conjunto de anotaciones, con un solo undo."""
+        if not anns or severity not in SEVERITY_LABELS:
+            return
+        changed = [a for a in anns if getattr(a, "severity", "nula") != severity]
+        if not changed:
+            return
+        self._push_undo()
+        for ann in changed:
+            ann.severity = severity
+            box = self._box_for_ann(ann)
+            if box:
+                box._apply_style(box.isSelected())   # refresca el texto del label
+        self._refresh_ann_list()
+        if self._autosave_cb.isChecked():
+            self.save_annotations()
+        self._status_label.setText(
+            f"{len(changed)} caja(s) → criticidad {SEVERITY_LABELS[severity]}")
 
     def _accept_anns(self, anns: list):
         """Aceptar (provisional → human) un conjunto de anotaciones, con un solo undo."""
@@ -1195,18 +1247,32 @@ class AnnotationEditor(QWidget):
     def _show_class_menu_for_box(self, box: "BoundingBoxItem"):
         """Context menu triggered by right-click on a bbox in the canvas."""
         menu = QMenu(self._view)
+        class_menu = menu.addMenu("Clase")
         for class_id, (name, color) in self._classes.items():
-            action = menu.addAction(name)
+            action = class_menu.addAction(name)
             action.setData((class_id, name, color))
             if box.annotation.class_id == class_id:
                 font = action.font()
                 font.setBold(True)
                 action.setFont(font)
+        sev_menu = menu.addMenu("Criticidad")
+        for key in SEVERITY_ORDER:
+            act = sev_menu.addAction(SEVERITY_LABELS[key])
+            act.setData(key)
+            if getattr(box.annotation, "severity", "nula") == key:
+                font = act.font()
+                font.setBold(True)
+                act.setFont(font)
         chosen = menu.exec(self._view.mapToGlobal(
             self._view.mapFromScene(box.sceneBoundingRect().topRight())
         ))
-        if chosen and chosen.data():
-            self._apply_class_change(box.annotation, chosen.data())
+        if not chosen:
+            return
+        data = chosen.data()
+        if isinstance(data, tuple):
+            self._apply_class_change(box.annotation, data)
+        elif data in SEVERITY_LABELS:
+            self._apply_severity_many([box.annotation], data)
 
     def _apply_class_change(self, ann: Annotation, class_data: tuple):
         if not class_data:
@@ -1260,6 +1326,7 @@ class AnnotationEditor(QWidget):
                 self._image.id, ann.class_id,
                 ann.x, ann.y, ann.width, ann.height,
                 ann.source, ann.confidence, polygon=ann.polygon,
+                severity=getattr(ann, "severity", "nula"),
             )
             ann.id = new_id
         self.annotation_saved.emit(self._image.id)

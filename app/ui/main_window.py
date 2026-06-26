@@ -19,7 +19,7 @@ from .dialogs import (
     NewProjectDialog, ClassManagerDialog, ExportDialog, LoadAnnotationsDialog,
     AutoLabelDialog, TrainModelDialog, PredictWithModelDialog,
     NearDuplicatesDialog, AutoLabelHubDialog, ActiveLearningDialog,
-    ConceptDiscoveryDialog,
+    ConceptDiscoveryDialog, BatchClassChangeDialog,
 )
 from ..core.project import Project
 from ..core.project_manifest import open_project_from_manifest
@@ -611,6 +611,8 @@ class MainWindow(QMainWindow):
         self._image_grid.delete_requested.connect(self._on_delete_images)
         self._image_grid.batch_status_requested.connect(self._on_batch_status_from_grid)
         self._image_grid.batch_label_requested.connect(self._on_batch_label_from_grid)
+        self._image_grid.batch_relabel_requested.connect(self._on_batch_relabel)
+        self._image_grid.batch_delete_annotations_requested.connect(self._on_batch_delete_annotations)
         self._image_grid.search_requested.connect(self._on_search_text)
         self._image_grid.search_similar_requested.connect(self._on_search_similar)
         self._tabs.addTab(self._image_grid, "Grilla de Imágenes")
@@ -2165,6 +2167,54 @@ class MainWindow(QMainWindow):
         self._status_label.setText(
             f"{len(image_ids)} imagen(es) etiquetadas como '{class_name}'"
         )
+
+    def _on_batch_relabel(self, image_ids: list):
+        if not self._project or not image_ids:
+            return
+        classes = self._project.db.get_all_classes()
+        if not classes:
+            return
+        dlg = BatchClassChangeDialog(self, classes=classes, n_images=len(image_ids))
+        if not dlg.exec():
+            return
+        n = self._project.db.relabel_annotations_for_images(
+            image_ids, dlg.to_class_id,
+            from_class_id=dlg.from_class_id, only_suggested=dlg.only_suggested)
+        self._image_grid._deselect_all()
+        self._load_all_images()
+        self._status_label.setText(
+            f"{n} caja(s) reasignadas de clase en {len(image_ids)} imagen(es)")
+        QMessageBox.information(self, "Cambiar clase de cajas",
+                               f"Cajas reasignadas: {n}")
+
+    def _on_batch_delete_annotations(self, image_ids: list, class_id: int,
+                                     only_suggested: bool):
+        if not self._project or not image_ids:
+            return
+        db = self._project.db
+        cid = class_id if class_id is not None and class_id >= 0 else None
+        if cid is not None:
+            cls_name = {r[0]: r[1] for r in db.get_all_classes()}.get(cid, "?")
+            scope = f"de la clase «{cls_name}»"
+        elif only_suggested:
+            scope = "sugeridas por IA"
+        else:
+            scope = "TODAS las"
+        reply = QMessageBox.question(
+            self, "Borrar etiquetas",
+            f"¿Borrar las etiquetas {scope} de {len(image_ids)} imagen(es)?\n"
+            "Las imágenes NO se borran del proyecto.",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        n = db.delete_annotations_for_images(
+            image_ids, class_id=cid, only_suggested=only_suggested)
+        self._image_grid._deselect_all()
+        self._load_all_images()
+        self._status_label.setText(
+            f"{n} etiqueta(s) borradas en {len(image_ids)} imagen(es)")
+        QMessageBox.information(self, "Borrar etiquetas",
+                               f"Etiquetas borradas: {n}")
 
     def _on_delete_images(self, image_ids: list):
         if not self._project or not image_ids:

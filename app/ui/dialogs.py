@@ -1043,6 +1043,69 @@ class NearDuplicatesDialog(QDialog):
         return "report"
 
 
+class BatchClassChangeDialog(QDialog):
+    """Reasigna la clase de las bounding boxes existentes en un lote de imágenes
+    (preserva la geometría)."""
+
+    def __init__(self, parent=None, classes=None, n_images: int = 0):
+        super().__init__(parent)
+        self.setWindowTitle("Cambiar clase de cajas (lote)")
+        self.setMinimumWidth(440)
+        self._classes = classes or []
+        self._setup_ui(n_images)
+
+    def _setup_ui(self, n_images: int):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        info = QLabel(
+            f"Reasigna la clase de las cajas en <b>{n_images}</b> imagen(es) "
+            f"seleccionadas. No cambia la posición de las cajas.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#bbb;")
+        layout.addWidget(info)
+
+        form = QFormLayout()
+        self._from_combo = QComboBox()
+        self._from_combo.addItem("Cualquier clase", None)
+        for cid, name, color in self._classes:
+            self._from_combo.addItem(name, cid)
+        form.addRow("Cambiar cajas de:", self._from_combo)
+
+        self._to_combo = QComboBox()
+        for cid, name, color in self._classes:
+            self._to_combo.addItem(name, cid)
+        form.addRow("a la clase:", self._to_combo)
+        layout.addLayout(form)
+
+        self._only_suggested_cb = QCheckBox("Solo sugerencias (IA), no tocar las humanas")
+        layout.addWidget(self._only_suggested_cb)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Cambiar")
+        buttons.accepted.connect(self._validate)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _validate(self):
+        if self.to_class_id is None:
+            QMessageBox.warning(self, "Cambiar clase", "Elegí una clase destino.")
+            return
+        self.accept()
+
+    @property
+    def from_class_id(self):
+        return self._from_combo.currentData()
+
+    @property
+    def to_class_id(self):
+        return self._to_combo.currentData()
+
+    @property
+    def only_suggested(self) -> bool:
+        return self._only_suggested_cb.isChecked()
+
+
 class AutoLabelHubDialog(QDialog):
     """Centro unificado de auto-etiquetado: elegí motor (SAM 3 texto, YOLOE visual,
     entrenar YOLO nano, o modelo .pt) y alcance (imagen actual / grupo / pendientes

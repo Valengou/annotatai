@@ -109,6 +109,7 @@ class Database:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
         self._ensure_review_metadata_columns()
+        self._ensure_annotation_columns()
         self._conn.commit()
 
     def _ensure_review_metadata_columns(self):
@@ -123,6 +124,12 @@ class Database:
         for name, definition in columns.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE images ADD COLUMN {name} {definition}")
+
+    def _ensure_annotation_columns(self):
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(annotations)").fetchall()}
+        if "severity" not in existing:
+            self._conn.execute(
+                "ALTER TABLE annotations ADD COLUMN severity TEXT DEFAULT 'nula'")
 
     def close(self):
         if self._conn:
@@ -528,12 +535,13 @@ class Database:
     def insert_annotation(self, image_id: int, class_id: int,
                           x: float, y: float, w: float, h: float,
                           source: str = "human", confidence: float = 1.0,
-                          polygon: list[tuple[float, float]] | None = None) -> int:
+                          polygon: list[tuple[float, float]] | None = None,
+                          severity: str = "nula") -> int:
         with self.cursor() as cur:
             cur.execute(
-                "INSERT INTO annotations (image_id, class_id, x, y, width, height, source, confidence) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (image_id, class_id, x, y, w, h, source, confidence),
+                "INSERT INTO annotations (image_id, class_id, x, y, width, height, source, confidence, severity) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (image_id, class_id, x, y, w, h, source, confidence, severity),
             )
             ann_id = cur.lastrowid
             if polygon:
@@ -567,6 +575,11 @@ class Database:
                 (class_id, x, y, w, h, ann_id),
             )
 
+    def update_annotation_severity(self, ann_id: int, severity: str):
+        with self.cursor() as cur:
+            cur.execute("UPDATE annotations SET severity=? WHERE id=?",
+                        (severity, ann_id))
+
     def delete_annotation(self, ann_id: int):
         with self.cursor() as cur:
             cur.execute("DELETE FROM annotations WHERE id=?", (ann_id,))
@@ -592,7 +605,7 @@ class Database:
         with self.cursor() as cur:
             cur.execute(
                 "SELECT a.id, a.image_id, a.class_id, c.name, a.x, a.y, a.width, a.height, "
-                "a.source, a.confidence, p.points_json "
+                "a.source, a.confidence, p.points_json, a.severity "
                 "FROM annotations a JOIN classes c ON c.id=a.class_id "
                 "LEFT JOIN annotation_polygons p ON p.annotation_id=a.id "
                 "WHERE a.image_id=? ORDER BY a.id",
@@ -603,6 +616,45 @@ class Database:
     def delete_annotations_for_image(self, image_id: int):
         with self.cursor() as cur:
             cur.execute("DELETE FROM annotations WHERE image_id=?", (image_id,))
+
+    def relabel_annotations_for_images(self, image_ids: list, to_class_id: int,
+                                       from_class_id: int | None = None,
+                                       only_suggested: bool = False) -> int:
+        """Reasigna la clase de las cajas existentes (preserva la geometría).
+        `from_class_id=None` afecta a todas las clases; `only_suggested` limita a
+        las cajas de IA (source != 'human')."""
+        if not image_ids:
+            return 0
+        with self.cursor() as cur:
+            ph = ",".join("?" * len(image_ids))
+            sql = f"UPDATE annotations SET class_id=? WHERE image_id IN ({ph})"
+            params: list = [to_class_id] + list(image_ids)
+            if from_class_id is not None:
+                sql += " AND class_id=?"
+                params.append(from_class_id)
+            if only_suggested:
+                sql += " AND source!='human'"
+            cur.execute(sql, params)
+            return cur.rowcount
+
+    def delete_annotations_for_images(self, image_ids: list,
+                                      class_id: int | None = None,
+                                      only_suggested: bool = False) -> int:
+        """Borra anotaciones de un conjunto de imágenes, opcionalmente filtrando
+        por clase y/o solo las sugeridas por IA (source != 'human')."""
+        if not image_ids:
+            return 0
+        with self.cursor() as cur:
+            ph = ",".join("?" * len(image_ids))
+            sql = f"DELETE FROM annotations WHERE image_id IN ({ph})"
+            params: list = list(image_ids)
+            if class_id is not None:
+                sql += " AND class_id=?"
+                params.append(class_id)
+            if only_suggested:
+                sql += " AND source!='human'"
+            cur.execute(sql, params)
+            return cur.rowcount
 
     def delete_annotations_by_source(self, image_id: int, source: str):
         with self.cursor() as cur:

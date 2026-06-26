@@ -343,6 +343,8 @@ class ImageGrid(QWidget):
     delete_requested       = Signal(list)        # list[int] image_ids
     batch_status_requested = Signal(list, str)   # list[int] image_ids, status
     batch_label_requested  = Signal(list, int)   # list[int] image_ids, class_id
+    batch_relabel_requested = Signal(list)        # list[int] image_ids (reasignar clase de cajas)
+    batch_delete_annotations_requested = Signal(list, int, bool)  # ids, class_id(-1=todas), solo_sugeridas
     search_requested       = Signal(str)         # texto a buscar (SigLIP2)
     search_similar_requested = Signal(int)       # image_id de ejemplo
     search_cleared         = Signal()
@@ -526,6 +528,30 @@ class ImageGrid(QWidget):
         self._label_btn.clicked.connect(self._show_label_menu)
         bar.addWidget(self._label_btn)
 
+        self._relabel_btn = QPushButton("Cambiar clase de cajas")
+        self._relabel_btn.setFixedHeight(26)
+        self._relabel_btn.setStyleSheet(
+            "background: #2a6a6a; color: white; font-weight: bold;"
+            "border-radius: 4px; padding: 0 10px;"
+        )
+        self._relabel_btn.setToolTip(
+            "Reasignar la clase de las cajas existentes (preserva la geometría)")
+        self._relabel_btn.clicked.connect(
+            lambda: self.batch_relabel_requested.emit(list(self._checked_ids)))
+        bar.addWidget(self._relabel_btn)
+
+        self._del_labels_btn = QPushButton("Borrar etiquetas ▾")
+        self._del_labels_btn.setFixedHeight(26)
+        self._del_labels_btn.setStyleSheet(
+            "background: #7a4a1a; color: white; font-weight: bold;"
+            "border-radius: 4px; padding: 0 10px;"
+        )
+        self._del_labels_btn.setToolTip(
+            "Borrar las anotaciones de las imágenes seleccionadas\n"
+            "(no borra las imágenes). Útil tras un auto-etiquetado malo.")
+        self._del_labels_btn.clicked.connect(self._show_delete_labels_menu)
+        bar.addWidget(self._del_labels_btn)
+
         self._del_btn = QPushButton("Eliminar del proyecto")
         self._del_btn.setFixedHeight(26)
         self._del_btn.setStyleSheet(
@@ -559,6 +585,7 @@ class ImageGrid(QWidget):
         self._checked_ids.clear()
         if ann_cache is not None:
             self._ann_cache = ann_cache
+        self._rebuild_class_filter_bar()   # solo clases presentes en las imágenes
         self._rebuild_grid()
         self._apply_filters()
 
@@ -816,14 +843,37 @@ class ImageGrid(QWidget):
         """Receive [(id, name, color), ...] from main window. Rebuilds class filter bar."""
         self._classes = classes
         self._class_filter = None
+        self._rebuild_class_filter_bar()
 
+    def _used_class_names(self) -> set:
+        """Nombres de clase que aparecen en alguna anotación del cache."""
+        used = set()
+        for anns in self._ann_cache.values():
+            for a in anns:
+                if len(a) > 5 and a[5]:
+                    used.add(a[5])
+        return used
+
+    def _rebuild_class_filter_bar(self):
+        """Arma la barra de chips SOLO con las clases presentes en las imágenes."""
         # Clear old buttons
         while self._class_filter_layout.count():
             item = self._class_filter_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        if not classes:
+        if not self._classes:
+            self._class_filter_bar.setVisible(False)
+            return
+
+        used = self._used_class_names()
+        present = [(cid, name, color) for cid, name, color in self._classes
+                   if name in used]
+        # Si el filtro activo ya no está presente, resetear a "Todas"
+        if self._class_filter is not None and self._class_filter not in used:
+            self._class_filter = None
+
+        if not present:
             self._class_filter_bar.setVisible(False)
             return
 
@@ -838,24 +888,25 @@ class ImageGrid(QWidget):
         # "Todas" button
         all_btn = QPushButton("Todas")
         all_btn.setCheckable(True)
-        all_btn.setChecked(True)
+        all_btn.setChecked(self._class_filter is None)
         all_btn.setFixedHeight(24)
         all_btn.setMinimumWidth(48)
         all_btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
-        all_btn.setStyleSheet(self._class_btn_style("#555", checked=True))
+        all_btn.setStyleSheet(self._class_btn_style("#555", checked=self._class_filter is None))
         all_btn.clicked.connect(lambda: self._set_class_filter(None))
         self._class_btn_group.addButton(all_btn, -1)
         self._class_filter_layout.addWidget(all_btn)
         self._all_class_btn = all_btn
 
-        for class_id, name, color in classes:
+        for class_id, name, color in present:
             btn = QPushButton(name)
             btn.setCheckable(True)
+            btn.setChecked(name == self._class_filter)
             btn.setFixedHeight(24)
             btn.setMinimumWidth(48)
             btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
             btn.setToolTip(name)
-            btn.setStyleSheet(self._class_btn_style(color, checked=False))
+            btn.setStyleSheet(self._class_btn_style(color, checked=(name == self._class_filter)))
             btn.setProperty("class_color", color)
             btn.clicked.connect(lambda checked, n=name, b=btn, c=color: self._on_class_btn(n, b, c))
             self._class_btn_group.addButton(btn)
@@ -899,3 +950,25 @@ class ImageGrid(QWidget):
         ))
         if chosen and chosen.data() is not None:
             self.batch_label_requested.emit(list(self._checked_ids), chosen.data())
+
+    def _show_delete_labels_menu(self):
+        if not self._checked_ids:
+            return
+        ids = list(self._checked_ids)
+        menu = QMenu(self)
+        menu.addAction(
+            "Borrar TODAS las etiquetas",
+            lambda: self.batch_delete_annotations_requested.emit(ids, -1, False))
+        menu.addAction(
+            "Borrar solo sugerencias (IA)",
+            lambda: self.batch_delete_annotations_requested.emit(ids, -1, True))
+        if self._classes:
+            menu.addSeparator()
+            sub = menu.addMenu("Borrar por clase")
+            for class_id, name, _color in self._classes:
+                sub.addAction(
+                    name,
+                    lambda checked=False, c=class_id:
+                        self.batch_delete_annotations_requested.emit(ids, c, False))
+        menu.exec(self._del_labels_btn.mapToGlobal(
+            self._del_labels_btn.rect().bottomLeft()))

@@ -16,6 +16,7 @@ class Annotation:
     source: str = "human"   # human | suggested | propagated
     confidence: float = 1.0
     polygon: Optional[list[tuple[float, float]]] = None
+    severity: str = "nula"  # nula | leve | moderada | critica
 
     def to_yolo_line(self, class_index: int) -> str:
         cx = self.x + self.width / 2
@@ -39,4 +40,5 @@ class Annotation:
             source=row[8] if len(row) > 8 else "human",
             confidence=row[9] if len(row) > 9 else 1.0,
             polygon=polygon,
+            severity=(row[11] if len(row) > 11 and row[11] else "nula"),
         )

@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QScrollArea, QFrame, QCheckBox, QButtonGroup,
+    QScrollArea, QFrame, QCheckBox, QButtonGroup, QComboBox,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QColor
@@ -161,6 +161,7 @@ class GraphView(QWidget):
         self._statuses: list[str] = []
         self._scatter             = None
         self._status_filter: str  = "todas"
+        self._class_filter: str | None = None
 
         # lasso state
         self._lasso               = None
@@ -221,6 +222,14 @@ class GraphView(QWidget):
         reset_btn.setFixedWidth(90)
         reset_btn.clicked.connect(self._reset_view)
         top.addWidget(reset_btn)
+
+        cls_lbl = QLabel("Clase:")
+        cls_lbl.setStyleSheet("color:#999; font-size:11px; margin-left:10px;")
+        top.addWidget(cls_lbl)
+        self._class_combo = QComboBox()
+        self._class_combo.addItem("Todas", None)
+        self._class_combo.currentIndexChanged.connect(self._on_class_filter_changed)
+        top.addWidget(self._class_combo)
 
         top.addStretch()
         self._info_label = QLabel("Sin datos")
@@ -345,6 +354,54 @@ class GraphView(QWidget):
         if HAS_MPL and self._proj_rows:
             self._redraw()
 
+    def _image_has_class(self, image_id: int, name: str) -> bool:
+        for a in self._ann_cache.get(image_id, []):
+            if len(a) > 5 and a[5] == name:
+                return True
+        return False
+
+    def _visible_mask(self) -> np.ndarray:
+        n = len(self._xs)
+        if n == 0:
+            return np.array([], dtype=bool)
+        if self._status_filter == "todas":
+            status_ok = np.ones(n, dtype=bool)
+        else:
+            status_ok = np.array([s == self._status_filter for s in self._statuses])
+        if self._class_filter is None:
+            class_ok = np.ones(n, dtype=bool)
+        else:
+            class_ok = np.array(
+                [self._image_has_class(self._image_ids[i], self._class_filter)
+                 for i in range(n)])
+        return status_ok & class_ok
+
+    def _on_class_filter_changed(self):
+        self._class_filter = self._class_combo.currentData()
+        if HAS_MPL and self._proj_rows:
+            self._redraw()
+
+    def _rebuild_class_combo(self):
+        """Combo con SOLO las clases presentes en las anotaciones."""
+        if not HAS_MPL:
+            return
+        present = set()
+        for anns in self._ann_cache.values():
+            for a in anns:
+                if len(a) > 5 and a[5]:
+                    present.add(a[5])
+        names = [name for _cid, name, _color in self._classes if name in present]
+        self._class_combo.blockSignals(True)
+        self._class_combo.clear()
+        self._class_combo.addItem("Todas", None)
+        for name in names:
+            self._class_combo.addItem(name, name)
+        if self._class_filter in names:
+            self._class_combo.setCurrentText(self._class_filter)
+        else:
+            self._class_filter = None
+        self._class_combo.blockSignals(False)
+
     def highlight_point(self, image_id: int):
         if not self._proj_rows or not HAS_MPL:
             return
@@ -383,10 +440,7 @@ class GraphView(QWidget):
 
         colors = [self._cluster_colors.get(r[5], "#808080") for r in self._proj_rows]
 
-        if self._status_filter == "todas":
-            match = np.ones(len(self._xs), dtype=bool)
-        else:
-            match = np.array([s == self._status_filter for s in self._statuses])
+        match = self._visible_mask()
 
         # Dim non-matching
         if (~match).any():
@@ -440,10 +494,7 @@ class GraphView(QWidget):
         path = MplPath(verts)
         points = np.column_stack([self._xs, self._ys])
         in_lasso = path.contains_points(points)
-
-        if self._status_filter != "todas":
-            status_ok = np.array([s == self._status_filter for s in self._statuses])
-            in_lasso  = in_lasso & status_ok
+        in_lasso = in_lasso & self._visible_mask()   # estado + clase
 
         self._selected_mask = in_lasso
         self._redraw()
@@ -547,10 +598,12 @@ class GraphView(QWidget):
     def set_classes(self, classes: list):
         """Receive [(id, name, color), ...] from main window."""
         self._classes = classes
+        self._rebuild_class_combo()
 
     def set_ann_cache(self, ann_cache: dict):
         """Receive {image_id: [(x,y,w,h,color,name),...]} from main window."""
         self._ann_cache = ann_cache
+        self._rebuild_class_combo()   # combo solo con clases presentes
 
     def _get_chip(self, image_id: int) -> tuple[str, str]:
         """Return (class_name, class_color) for classification chip, or ('','')."""
@@ -627,11 +680,11 @@ class GraphView(QWidget):
         ax_range = self._ax.get_xlim()
         radius   = (ax_range[1] - ax_range[0]) * 0.025
         dists    = np.sqrt((self._xs - event.xdata)**2 + (self._ys - event.ydata)**2)
+        vis      = self._visible_mask()
         for nearest in np.argsort(dists):
             if dists[nearest] >= radius:
                 break
-            if (self._status_filter != "todas"
-                    and self._statuses[nearest] != self._status_filter):
+            if len(vis) and not vis[nearest]:
                 continue
             img_id = self._image_ids[nearest]
             self._info_label.setText(
